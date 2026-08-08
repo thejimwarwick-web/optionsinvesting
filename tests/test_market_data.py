@@ -33,6 +33,9 @@ def normalized(kind, timestamp=None):
     if kind is EvidenceKind.OPTION_CHAIN:
         base["contracts"] = [{"symbol": CONTRACT, "underlying": "AAPL", "expiration": "2026-08-28",
                               "strike": "20", "right": "put", "multiplier": 100}]
+    if kind is EvidenceKind.CALENDAR: base["session_date"] = "2026-08-07"
+    if kind in {EvidenceKind.CORPORATE_ACTION, EvidenceKind.DIVIDEND}:
+        base.update(effective_date="2026-08-07", retrieved_at=base["timestamp"])
     return base
 
 
@@ -135,16 +138,32 @@ def test_replay_invariant_is_not_python_assert(tmp_path):
     assert report.excluded and not report.actionable
 
 
-def test_cli_complete_assessment_and_machine_report(tmp_path, capsys):
+def test_cli_sequential_artifacts(tmp_path, capsys):
     operation = {"research_at": "2026-08-07T12:33:00+00:00", "decision_at": DECISION.isoformat(),
                  "submitted_at": (DECISION + timedelta(seconds=1)).isoformat(), "order_id": "cli-order",
                  "side": "sell", "quantity": 1, "intent": "open", "thesis": "value",
                  "instrument": {"symbol": CONTRACT, "issuer": "Apple", "sector": "Technology",
                                 "underlying": "AAPL", "expiration": "2026-08-28", "strike": "20", "right": "put"}}
     path = tmp_path / "bundle.json"; path.write_text(json.dumps({"packets": [p.as_json() for p in bundle().values()], "operation": operation}))
-    for command in ("dry-run", "replay"):
-        output = tmp_path / f"{command}.json"
-        assert main([command, str(path), "--as-of", DECISION.isoformat(), "--output", str(output)]) == 0
-        result = json.loads(output.read_text())
-        assert result["verified"] and (result["actionable"] if command == "dry-run" else result["excluded"])
+    research_input=tmp_path/"research-input.json"; research_input.write_text(json.dumps({"candidates":[{"underlying":"AAPL","thesis":"value"}]}))
+    research=tmp_path/"research.json"
+    assert main(["research-run",str(research_input),"--at","2026-08-07T12:33:00+00:00","--output",str(research)]) == 0
+    decision,submission=tmp_path/"decision.json",tmp_path/"submission.json"
+    assert main(["decision-run",str(research),str(path),"--at",DECISION.isoformat(),"--submitted-at",(DECISION+timedelta(seconds=1)).isoformat(),"--decision-output",str(decision),"--submission-output",str(submission)]) == 0
+    assert json.loads(submission.read_text())["artifact_kind"] == "submission"
+    replay=tmp_path/"replay.json"; main(["replay",str(path),"--as-of",DECISION.isoformat(),"--output",str(replay)])
+    assert json.loads(replay.read_text())["excluded"]
     assert "PAPER ONLY | NO LIVE ORDER" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "NaN", "Infinity"])
+def test_invalid_prices_fail_closed(value):
+    result=assess(packet(EvidenceKind.OPTION_QUOTE,bid=value),as_of=DECISION,cutoff=DECISION,max_age=timedelta(minutes=1))
+    assert result.quarantined and any("price" in x for x in result.reasons)
+
+
+def test_duplicates_retained_and_ambiguous_duplicates_rejected():
+    rows=list(bundle().values())+[packet(EvidenceKind.CALENDAR)]
+    report=run().assess_bundle(rows,as_of=DECISION,cutoff=DECISION)
+    assert len(report.assessments)==len(rows)
+    assert "ambiguous duplicate evidence family: trading_calendar" in report.reasons

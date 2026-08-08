@@ -109,7 +109,7 @@ class Assessment:
 
 
 def assess(packet: EvidencePacket, *, as_of: datetime, cutoff: datetime,
-           max_age: timedelta, expected_symbol: str | None = None,
+           max_age: timedelta | None, expected_symbol: str | None = None,
            excluded: bool = False) -> Assessment:
     require_utc(as_of, "as_of"); require_utc(cutoff, "cutoff")
     reasons = list(packet.verify_reasons()); n = packet.normalized
@@ -122,17 +122,41 @@ def assess(packet: EvidencePacket, *, as_of: datetime, cutoff: datetime,
     else:
         if timestamp > as_of: reasons.append("future-dated")
         if timestamp > cutoff: reasons.append("observed post-cutoff")
-        if as_of - timestamp > max_age: reasons.append("stale")
+        if max_age is not None and as_of - timestamp > max_age: reasons.append("stale")
     if expected_symbol and n.get("symbol") != expected_symbol: reasons.append("mismatched symbol")
     if packet.kind in {EvidenceKind.UNDERLYING_QUOTE, EvidenceKind.OPTION_QUOTE, EvidenceKind.FX}:
         bid, ask, bs, az = n.get("bid"), n.get("ask"), n.get("bid_size"), n.get("ask_size")
         if bid is None or ask is None: reasons.append("one-sided")
         else:
             try:
-                if Decimal(str(bid)) > Decimal(str(ask)): reasons.append("crossed")
-            except InvalidOperation: reasons.append("unverifiable price")
-        if not isinstance(bs, int) or not isinstance(az, int) or bs <= 0 or az <= 0:
+                bid_value, ask_value = Decimal(str(bid)), Decimal(str(ask))
+                if not bid_value.is_finite() or not ask_value.is_finite(): reasons.append("non-finite price")
+                elif bid_value <= 0 or ask_value <= 0: reasons.append("non-positive price")
+                elif bid_value > ask_value: reasons.append("crossed")
+            except (InvalidOperation, ValueError): reasons.append("unverifiable price")
+        # Spot FX venues frequently publish no exchange size.  Absence is valid;
+        # an explicitly supplied size, however, must be positive.
+        if packet.kind is EvidenceKind.FX:
+            if (bs is not None and (not isinstance(bs, int) or bs <= 0)) or \
+               (az is not None and (not isinstance(az, int) or az <= 0)):
+                reasons.append("invalid FX size")
+            try:
+                mid = Decimal(str(n.get("mid")))
+                if not mid.is_finite() or mid <= 0: reasons.append("invalid FX mid")
+            except (InvalidOperation, ValueError): reasons.append("invalid FX mid")
+        elif not isinstance(bs, int) or not isinstance(az, int) or bs <= 0 or az <= 0:
             reasons.append("zero-size")
+    if packet.kind is EvidenceKind.CALENDAR:
+        session = n.get("session_date")
+        if session != as_of.date().isoformat(): reasons.append("calendar does not cover relevant session")
+    if packet.kind in {EvidenceKind.CORPORATE_ACTION, EvidenceKind.DIVIDEND}:
+        if not n.get("effective_date"): reasons.append("missing effective date")
+        if not n.get("retrieved_at"): reasons.append("missing retrieval timestamp")
+        else:
+            try:
+                retrieved = datetime.fromisoformat(str(n["retrieved_at"])).astimezone(UTC)
+                if retrieved > as_of: reasons.append("retrieved after as-of")
+            except (ValueError, TypeError): reasons.append("malformed retrieval timestamp")
     if packet.kind is EvidenceKind.OPTION_QUOTE:
         if packet.feed.upper() != "OPRA": reasons.append("option quote is not OPRA")
         for field in ("symbol", "underlying", "expiration", "strike", "right",
