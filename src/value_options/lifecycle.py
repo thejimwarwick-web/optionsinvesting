@@ -6,6 +6,7 @@ from decimal import Decimal
 from enum import Enum
 
 from .accounting import LedgerEvent
+from .calendar import MarketCalendarEvidence
 from .models import AssetType, Instrument, MarketQuote, OptionRight, Order, require_utc
 
 
@@ -25,16 +26,10 @@ class LifecycleDecision:
     effective_date: date | None = None
 
 
-def next_business_day(day: date) -> date:
-    candidate = day + timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate += timedelta(days=1)
-    return candidate
-
-
 def expiry_instruction(option: Instrument, spot: Decimal | None, evaluated_at: datetime,
                        market_close_at: datetime, evidence_complete: bool = True,
-                       after_hours_pending: bool = False) -> LifecycleDecision:
+                       after_hours_pending: bool = False,
+                       calendar_evidence: MarketCalendarEvidence | None = None) -> LifecycleDecision:
     """Close pin risk before expiry or physically assign at $0.01 ITM."""
     require_utc(evaluated_at, "evaluated_at")
     require_utc(market_close_at, "market_close_at")
@@ -46,9 +41,14 @@ def expiry_instruction(option: Instrument, spot: Decimal | None, evaluated_at: d
     if evaluated_at <= market_close_at and market_close_at - evaluated_at <= timedelta(hours=1) and distance <= Decimal("0.01"):
         return LifecycleDecision(LifecycleAction.CLOSE, "pin risk: within 1% of strike inside final hour")
     if after_hours_pending:
+        next_session = (calendar_evidence.next_session_after(option.expiry, evaluated_at)
+                        if calendar_evidence is not None else None)
+        if next_session is None:
+            return LifecycleDecision(LifecycleAction.QUARANTINE,
+                                     "missing, stale or unverified market-calendar evidence")
         return LifecycleDecision(LifecycleAction.RECONCILE_NEXT_BUSINESS_MORNING,
                                  "after-hours expiry evidence pending",
-                                 next_business_day(option.expiry))
+                                 next_session)
     intrinsic = spot - option.strike if option.right is OptionRight.CALL else option.strike - spot
     if intrinsic >= Decimal("0.01"):
         return LifecycleDecision(LifecycleAction.PHYSICAL_ASSIGNMENT, "$0.01 or more ITM at expiry")

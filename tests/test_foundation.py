@@ -5,6 +5,7 @@ from decimal import Decimal
 import pytest
 
 from value_options.accounting import LedgerEvent, PaperLedger, Position, reconcile
+from value_options.calendar import MarketCalendarEvidence
 from value_options.execution import conservative_fill
 from value_options.lifecycle import (
     LifecycleAction, assignment_events, deep_itm_csp_instruction, ex_dividend_instruction,
@@ -42,6 +43,11 @@ def quote(i=SHARE, bid="9.90", ask="10.10", at=R140, available=None):
 
 def portfolio(positions=None, marks=None, nav="100000", peak="100000", cash="100000"):
     return PortfolioRisk(Decimal(nav), Decimal(peak), Decimal(cash), positions or {}, marks or {})
+
+
+def calendar(start, end, sessions, observed_at=R140, verified=True):
+    return MarketCalendarEvidence("cal-1", "alpaca-read-only", "US", observed_at,
+                                  start, end, tuple(sessions), verified).sealed()
 
 
 def test_authoritative_capital_and_currency():
@@ -82,6 +88,22 @@ def test_london_cutoffs_convert_across_bst_and_gmt_and_block_market_open_data():
     with pytest.raises(ValueError, match="Europe/London"):
         ResearchPacket("fixed-utc", "2026.2", datetime(2026, 8, 10, 13, 30, tzinfo=UTC),
                        (candidate,), (), "wrong summer UTC")
+
+
+@pytest.mark.parametrize(("day", "research_utc", "decision_utc"), (
+    (date(2026, 3, 27), (13, 30), (14, 40)),  # Friday before BST begins
+    (date(2026, 3, 30), (12, 30), (13, 40)),  # Monday after BST begins
+    (date(2026, 10, 23), (12, 30), (13, 40)), # Friday before GMT resumes
+    (date(2026, 10, 26), (13, 30), (14, 40)), # Monday after GMT resumes
+))
+def test_london_cutoffs_at_bst_gmt_transitions(day, research_utc, decision_utc):
+    candidate = ResearchCandidate("ACME", "transition evidence")
+    research_at = datetime.combine(day, datetime.min.time(), UTC).replace(
+        hour=research_utc[0], minute=research_utc[1])
+    decision_at = datetime.combine(day, datetime.min.time(), UTC).replace(
+        hour=decision_utc[0], minute=decision_utc[1])
+    ResearchPacket(f"p-{day}", "2026.2", research_at, (candidate,), (), "timezone").sealed()
+    TradingDecision(f"d-{day}", f"p-{day}", decision_at, order(option()), ()).sealed()
 
 
 def test_1440_decision_and_prospective_submission_only():
@@ -224,10 +246,45 @@ def test_pin_risk_assignment_after_hours_and_quarantine():
     close = datetime(2026, 1, 5, 21, tzinfo=UTC)
     assert expiry_instruction(put, Decimal("20.10"), close - timedelta(minutes=30), close).action is LifecycleAction.CLOSE
     assert expiry_instruction(put, Decimal("19.99"), close + timedelta(minutes=1), close).action is LifecycleAction.PHYSICAL_ASSIGNMENT
-    pending = expiry_instruction(put, Decimal("19"), close, close, after_hours_pending=True)
+    evidence = calendar(DAY, DAY + timedelta(days=7), (DAY + timedelta(days=1),), close)
+    pending = expiry_instruction(put, Decimal("19"), close, close, after_hours_pending=True,
+                                 calendar_evidence=evidence)
     assert pending.action is LifecycleAction.RECONCILE_NEXT_BUSINESS_MORNING
     assert pending.effective_date == date(2026, 1, 6)
     assert expiry_instruction(put, None, close, close, evidence_complete=False).action is LifecycleAction.QUARANTINE
+
+
+def test_calendar_evidence_handles_us_holiday_and_normal_weekend():
+    close = datetime(2026, 7, 3, 21, tzinfo=UTC)
+    holiday_expiry = option(expiry=date(2026, 7, 3))
+    # Stored US evidence omits the observed Independence Day closure and weekend.
+    holiday_calendar = calendar(date(2026, 7, 3), date(2026, 7, 10),
+                                (date(2026, 7, 6), date(2026, 7, 7)), close)
+    holiday = expiry_instruction(holiday_expiry, Decimal("18"), close, close,
+                                 after_hours_pending=True, calendar_evidence=holiday_calendar)
+    assert holiday.effective_date == date(2026, 7, 6)
+
+    friday = date(2026, 8, 7)
+    weekend_expiry = option(expiry=friday)
+    weekend_close = datetime(2026, 8, 7, 21, tzinfo=UTC)
+    weekend_calendar = calendar(friday, date(2026, 8, 14), (date(2026, 8, 10),), weekend_close)
+    weekend = expiry_instruction(weekend_expiry, Decimal("18"), weekend_close, weekend_close,
+                                 after_hours_pending=True, calendar_evidence=weekend_calendar)
+    assert weekend.effective_date == date(2026, 8, 10)
+
+
+def test_calendar_evidence_missing_stale_or_unverified_quarantines():
+    close = datetime(2026, 1, 5, 21, tzinfo=UTC)
+    put = option(expiry=DAY)
+    missing = expiry_instruction(put, Decimal("18"), close, close, after_hours_pending=True)
+    assert missing.action is LifecycleAction.QUARANTINE
+    stale = calendar(DAY - timedelta(days=7), DAY, (DAY,), close)
+    assert expiry_instruction(put, Decimal("18"), close, close, True, True, stale).action is LifecycleAction.QUARANTINE
+    unverified = calendar(DAY, DAY + timedelta(days=7), (DAY + timedelta(days=1),), close, False)
+    assert expiry_instruction(put, Decimal("18"), close, close, True, True, unverified).action is LifecycleAction.QUARANTINE
+    tampered = replace(calendar(DAY, DAY + timedelta(days=7), (DAY + timedelta(days=1),), close),
+                       source="not-the-sealed-source")
+    assert expiry_instruction(put, Decimal("18"), close, close, True, True, tampered).action is LifecycleAction.QUARANTINE
 
 
 def test_physical_assignment_has_share_and_cash_legs_not_cash_settlement():

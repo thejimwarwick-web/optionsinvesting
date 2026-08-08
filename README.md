@@ -38,7 +38,7 @@ the ask and sells fill at the bid.
 
 US equity options are never generically cash settled. The lifecycle module applies
 $0.01 ITM physical assignment, final-hour pin closure within 1% of strike,
-next-business-morning after-hours reconciliation, covered-call sale-floor and
+next-open-session after-hours reconciliation, covered-call sale-floor and
 ex-dividend protection, evidence-based CSP assignment, separate roll orders, adjusted-contract
 freezing, and evidence quarantine. Assignment emits separate option-close, physical
 share, and strike-cash events.
@@ -56,11 +56,17 @@ same state, and reconciliation reports missing, unexpected, or mismatched record
 `AppendOnlyLedgerSink` is only a port for a future Google Sheets adapter.
 `ReadOnlyAlpaca` deliberately exposes reads only.
 
+Exchange sessions are never inferred from weekdays. Live and replay processing
+require a verified, sealed `MarketCalendarEvidence` observation whose coverage
+contains the event and a subsequent open session. The read-only evidence port is
+suitable for persisting an Alpaca calendar response. Missing, future-dated,
+out-of-coverage, unverified, or seal-invalid evidence quarantines the event.
+
 ## Deliberate limitations
 
 * No live ledger or broker adapter is implemented.
-* Holiday calendars are not embedded; next-business-day logic excludes weekends
-  only, so a production calendar/evidence adapter must supply exchange holidays.
+* No calendar downloader or holiday database is embedded. An operator must store
+  authoritative calendar evidence before lifecycle processing can proceed.
 * Corporate-action terms remain quarantined until an external OCC-verification
   adapter supplies evidence.
 * FX values and market marks are caller-supplied, sealed inputs; there is no market
@@ -74,3 +80,7 @@ python -m pytest
 python -m compileall -q src tests
 git diff --check
 ```
+
+CI runs these checks on Python 3.11, 3.12, and 3.13. The machine-readable
+`tests/mandate_conformance.json` maps every approved rule to passing and
+rejection/boundary coverage.
