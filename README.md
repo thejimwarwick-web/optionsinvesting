@@ -69,10 +69,12 @@ out-of-coverage, unverified, or seal-invalid evidence quarantines the event.
   authoritative calendar evidence before lifecycle processing can proceed.
 * Corporate-action terms remain quarantined until an external OCC-verification
   adapter supplies evidence.
-* The provider-neutral ingestion port is read-only and dependency injected. It
-  persists canonical raw and normalized JSON, provider/feed (including IEX or
-  OPRA), request/timing metadata, and SHA-256 seals; it deliberately contains no
-  network client, credentials, broker submission, or Google Sheets writer.
+* Initial provider-response ingestion is separate from packet loading. Ingestion
+  creates a content-addressed ID and seals exactly once; loading preserves supplied
+  hashes and seals for verification and cannot silently reseal tampered evidence.
+  Atomic locked JSONL replacement prevents partial writes and rejects ID collisions.
+  The dependency-injected read port deliberately contains no network client,
+  credentials, broker submission, or Google Sheets writer.
 * Clock/calendar, underlying and option quotes/chains, corporate actions,
   dividends, and GBP/USD are accepted as evidence kinds, but never synthesized.
   Invalid, stale, future, mismatched, crossed, zero-size, or late evidence fails
@@ -83,12 +85,16 @@ out-of-coverage, unverified, or seal-invalid evidence quarantines the event.
 
 ## Offline operational dry runs
 
-Both commands emit a human summary and a deterministic JSON artifact prominently
-marked `PAPER ONLY` and `NO LIVE ORDER`:
+Operational commands consume a complete evidence bundle and execute full evidence
+assessment. Reports distinguish verified, actionable, quarantined, and excluded
+evidence and enumerate every rejection reason. `inspect` is intentionally named as
+a single-packet inspection rather than an operational dry run. Every output is
+prominently marked `PAPER ONLY` and `NO LIVE ORDER`:
 
 ```bash
-value-options dry-run tests/fixtures/alpaca_opra_quote.json --output artifacts/dry-run.json
-value-options replay tests/fixtures/alpaca_opra_quote.json --output artifacts/replay.json
+value-options dry-run evidence-bundle.json --as-of 2026-08-07T13:40:30Z --output artifacts/dry-run.json
+value-options replay evidence-bundle.json --as-of 2026-08-07T13:40:30Z --output artifacts/replay.json
+value-options inspect tests/fixtures/alpaca_opra_quote.json --as-of 2026-08-07T13:40:03Z --output artifacts/inspection.json
 ```
 
 ## Tests

@@ -62,7 +62,7 @@ def test_research_packet_schedule_shortlist_and_hindsight():
     assert packet.verify()
     assert not replace(packet, rationale="hindsight edit").verify()
     with pytest.raises(ValueError, match="13:30"):
-        replace(packet, research_at=R130 + timedelta(minutes=1), seal="")
+        replace(packet, research_at=R130 - timedelta(minutes=1), seal="")
     with pytest.raises(ValueError, match="hindsight"):
         ResearchPacket("p2", "2026.2", R130, (candidate,),
                        (Observation("future", "x", R140),), "invalid")
@@ -85,9 +85,9 @@ def test_london_cutoffs_convert_across_bst_and_gmt_and_block_market_open_data():
     # 5 January 2026 is GMT, so the London cutoffs equal 13:30/14:40 UTC.
     ResearchPacket("gmt", "2026.2", R130, (candidate,), (), "winter").sealed()
     TradingDecision("gmt-d", "gmt", R140, order(option()), ()).sealed()
-    with pytest.raises(ValueError, match="Europe/London"):
-        ResearchPacket("fixed-utc", "2026.2", datetime(2026, 8, 10, 13, 30, tzinfo=UTC),
-                       (candidate,), (), "wrong summer UTC")
+    with pytest.raises(ValueError, match="13:30"):
+        ResearchPacket("too-early", "2026.2", datetime(2026, 8, 10, 11, 30, tzinfo=UTC),
+                       (candidate,), (), "before summer start")
 
 
 @pytest.mark.parametrize(("day", "research_utc", "decision_utc"), (
@@ -129,7 +129,7 @@ def test_quotes_reject_one_sided_crossed_zero_size_and_bad_market():
 
 
 def test_conservative_fill_timestamps_sides_and_staleness():
-    submission = OrderSubmission("d1", R140, order(SHARE), R140)
+    submission = OrderSubmission("d1", R140, order(SHARE), R140 + timedelta(microseconds=1))
     fill_at = R140 + timedelta(seconds=1)
     buy = conservative_fill("f1", submission, quote(at=R140), fill_at, 60)
     assert buy.price == Decimal("10.10") and buy.filled_at != buy.quote_market_at

@@ -1,11 +1,44 @@
 {
-  "packet_id": "alpaca-option-1",
-  "kind": "option_quote",
-  "provider": "alpaca",
+  "classification": "PAPER ONLY",
   "feed": "OPRA",
-  "request": {"symbol": "AAPL260821P00200000", "feed": "opra"},
-  "requested_at": "2026-08-07T13:40:01+00:00",
+  "kind": "option_quote",
+  "normalized": {
+    "ask": "4.20",
+    "ask_size": 12,
+    "bid": "4.10",
+    "bid_size": 10,
+    "currency": "USD",
+    "expiration": "2026-08-21",
+    "feed": "OPRA",
+    "market": "US",
+    "multiplier": 100,
+    "right": "put",
+    "strike": "200",
+    "symbol": "AAPL260821P00200000",
+    "timestamp": "2026-08-07T13:40:02+00:00",
+    "underlying": "AAPL"
+  },
+  "order_policy": "NO LIVE ORDER",
+  "packet_id": "2a26e5fe9f5d89b9801d7d8dac725105445a7793892700642d4f074540c7332f",
+  "provider": "alpaca",
+  "raw": {
+    "quote": {
+      "S": "AAPL260821P00200000",
+      "ap": 4.2,
+      "as": 12,
+      "bp": 4.1,
+      "bs": 10,
+      "t": "2026-08-07T13:40:02+00:00",
+      "u": "AAPL",
+      "x": "OPRA"
+    }
+  },
+  "raw_sha256": "8f3b5e6652378e0783940f235e4ef179e8db94fac29fed31691b1156c698d9b2",
   "received_at": "2026-08-07T13:40:03+00:00",
-  "raw": {"quote": {"bp": 4.1, "ap": 4.2, "bs": 10, "as": 12, "t": "2026-08-07T13:40:02+00:00"}},
-  "normalized": {"symbol": "AAPL260821P00200000", "bid": "4.10", "ask": "4.20", "bid_size": 10, "ask_size": 12, "timestamp": "2026-08-07T13:40:02+00:00", "expiration": "2026-08-21", "strike": "200", "feed": "OPRA"}
+  "request": {
+    "feed": "opra",
+    "symbol": "AAPL260821P00200000"
+  },
+  "requested_at": "2026-08-07T13:40:01+00:00",
+  "seal": "fb2e3ddcdbdd4e09ecea7a3cd5d8f220c9baf5f28a8c6143ffdc88371434e6b9"
 }

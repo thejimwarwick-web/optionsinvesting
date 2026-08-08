@@ -1,34 +1,31 @@
-"""Provider-neutral, sealed and strictly read-only market-data evidence."""
-
+"""Provider-neutral, tamper-evident, strictly read-only market evidence."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import Enum
+import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Mapping, Protocol
 
 from .models import UTC, require_utc
 
 
 def canonical_json(value: Any) -> bytes:
-    """RFC-8259-compatible deterministic JSON (providers must supply JSON values)."""
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
                       allow_nan=False).encode("utf-8")
 
 
 class EvidenceKind(str, Enum):
-    CLOCK = "market_clock"
-    CALENDAR = "trading_calendar"
-    UNDERLYING_QUOTE = "underlying_quote"
-    OPTION_CHAIN = "option_chain"
-    OPTION_QUOTE = "option_quote"
-    CORPORATE_ACTION = "corporate_action"
-    DIVIDEND = "dividend"
-    FX = "gbp_usd_fx"
+    CLOCK = "market_clock"; CALENDAR = "trading_calendar"
+    UNDERLYING_QUOTE = "underlying_quote"; OPTION_CHAIN = "option_chain"
+    OPTION_QUOTE = "option_quote"; CORPORATE_ACTION = "corporate_action"
+    DIVIDEND = "dividend"; FX = "gbp_usd_fx"
 
 
 @dataclass(frozen=True)
@@ -42,101 +39,138 @@ class EvidencePacket:
     received_at: datetime
     raw: Any
     normalized: Mapping[str, Any]
-    raw_sha256: str = ""
-    seal: str = ""
+    raw_sha256: str
+    seal: str
 
     def __post_init__(self) -> None:
-        require_utc(self.requested_at, "requested_at")
-        require_utc(self.received_at, "received_at")
-        if not self.packet_id or not self.provider or not self.feed:
-            raise ValueError("packet, provider and quote-feed identity are required")
-        if self.received_at < self.requested_at:
-            raise ValueError("response predates request")
+        require_utc(self.requested_at, "requested_at"); require_utc(self.received_at, "received_at")
 
-    def _document(self) -> dict[str, Any]:
-        return {"packet_id": self.packet_id, "kind": self.kind.value,
-                "provider": self.provider, "feed": self.feed,
+    def content(self) -> dict[str, Any]:
+        return {"kind": self.kind.value, "provider": self.provider, "feed": self.feed,
                 "request": self.request, "requested_at": self.requested_at.isoformat(),
                 "received_at": self.received_at.isoformat(), "raw": self.raw,
-                "normalized": self.normalized,
-                "raw_sha256": self.raw_sha256}
+                "normalized": self.normalized}
 
-    def sealed(self) -> "EvidencePacket":
-        if self.seal or self.raw_sha256:
-            raise ValueError("packet is already sealed")
-        raw_hash = hashlib.sha256(canonical_json(self.raw)).hexdigest()
-        packet = replace(self, raw_sha256=raw_hash)
-        return replace(packet, seal=hashlib.sha256(canonical_json(packet._document())).hexdigest())
+    def envelope(self) -> dict[str, Any]:
+        return {"packet_id": self.packet_id, **self.content(), "raw_sha256": self.raw_sha256}
 
-    def verify(self) -> bool:
-        if not self.raw_sha256 or not self.seal:
-            return False
-        return (self.raw_sha256 == hashlib.sha256(canonical_json(self.raw)).hexdigest()
-                and self.seal == hashlib.sha256(canonical_json(self._document())).hexdigest())
+    def verify_reasons(self) -> tuple[str, ...]:
+        reasons: list[str] = []
+        if not self.provider or not self.feed: reasons.append("missing source identity")
+        if self.received_at < self.requested_at: reasons.append("response predates request")
+        expected_raw = hashlib.sha256(canonical_json(self.raw)).hexdigest()
+        expected_id = hashlib.sha256(canonical_json(self.content())).hexdigest()
+        expected_seal = hashlib.sha256(canonical_json(self.envelope())).hexdigest()
+        if self.raw_sha256 != expected_raw: reasons.append("raw hash mismatch")
+        if self.packet_id != expected_id: reasons.append("packet ID is not content-addressed")
+        if self.seal != expected_seal: reasons.append("seal mismatch")
+        return tuple(reasons)
+
+    def verify(self) -> bool: return not self.verify_reasons()
 
     def as_json(self) -> dict[str, Any]:
-        return {**self._document(), "seal": self.seal, "classification": "PAPER ONLY",
+        return {**self.envelope(), "seal": self.seal, "classification": "PAPER ONLY",
                 "order_policy": "NO LIVE ORDER"}
+
+
+def ingest_response(*, kind: EvidenceKind, provider: str, feed: str,
+                    request: Mapping[str, Any], requested_at: datetime,
+                    received_at: datetime, raw: Any,
+                    normalized: Mapping[str, Any]) -> EvidencePacket:
+    """Create and seal provider evidence exactly once; imported packets never use this path."""
+    content = {"kind": kind.value, "provider": provider, "feed": feed, "request": request,
+               "requested_at": requested_at.isoformat(), "received_at": received_at.isoformat(),
+               "raw": raw, "normalized": normalized}
+    packet_id = hashlib.sha256(canonical_json(content)).hexdigest()
+    raw_hash = hashlib.sha256(canonical_json(raw)).hexdigest()
+    envelope = {"packet_id": packet_id, **content, "raw_sha256": raw_hash}
+    return EvidencePacket(packet_id, kind, provider, feed, request, requested_at, received_at,
+                          raw, normalized, raw_hash,
+                          hashlib.sha256(canonical_json(envelope)).hexdigest())
+
+
+def load_packet(value: Mapping[str, Any]) -> EvidencePacket:
+    """Load supplied cryptographic fields verbatim. It deliberately cannot reseal."""
+    return EvidencePacket(str(value.get("packet_id", "")), EvidenceKind(value["kind"]),
+                          str(value.get("provider", "")), str(value.get("feed", "")),
+                          value.get("request", {}), datetime.fromisoformat(value["requested_at"]),
+                          datetime.fromisoformat(value["received_at"]), value.get("raw"),
+                          value.get("normalized", {}), str(value.get("raw_sha256", "")),
+                          str(value.get("seal", "")))
 
 
 @dataclass(frozen=True)
 class Assessment:
-    accepted: bool
-    reasons: tuple[str, ...] = ()
+    verified: bool
+    actionable: bool
+    quarantined: bool
+    excluded: bool
+    reasons: tuple[str, ...]
 
 
 def assess(packet: EvidencePacket, *, as_of: datetime, cutoff: datetime,
-           max_age: timedelta = timedelta(minutes=15), expected_symbol: str | None = None) -> Assessment:
-    """Fail closed without synthesising any absent field."""
+           max_age: timedelta, expected_symbol: str | None = None,
+           excluded: bool = False) -> Assessment:
     require_utc(as_of, "as_of"); require_utc(cutoff, "cutoff")
-    n, reasons = packet.normalized, []
-    if not packet.verify(): reasons.append("unverifiable")
+    reasons = list(packet.verify_reasons()); n = packet.normalized
+    if packet.received_at > as_of: reasons.append("received after as-of")
+    if packet.received_at > cutoff: reasons.append("received post-cutoff")
     observed = n.get("timestamp")
-    try: timestamp = datetime.fromisoformat(observed) if isinstance(observed, str) else None
+    try: timestamp = datetime.fromisoformat(observed).astimezone(UTC) if isinstance(observed, str) else None
     except ValueError: timestamp = None
-    if timestamp is None or timestamp.tzinfo is None: reasons.append("missing timestamp")
+    if timestamp is None: reasons.append("missing timestamp")
     else:
-        timestamp = timestamp.astimezone(UTC)
         if timestamp > as_of: reasons.append("future-dated")
+        if timestamp > cutoff: reasons.append("observed post-cutoff")
         if as_of - timestamp > max_age: reasons.append("stale")
-        if timestamp > cutoff or packet.received_at > cutoff: reasons.append("post-cutoff")
-    if expected_symbol and n.get("symbol") != expected_symbol: reasons.append("mismatched")
+    if expected_symbol and n.get("symbol") != expected_symbol: reasons.append("mismatched symbol")
     if packet.kind in {EvidenceKind.UNDERLYING_QUOTE, EvidenceKind.OPTION_QUOTE, EvidenceKind.FX}:
-        bid, ask = n.get("bid"), n.get("ask")
-        bs, ass = n.get("bid_size"), n.get("ask_size")
+        bid, ask, bs, az = n.get("bid"), n.get("ask"), n.get("bid_size"), n.get("ask_size")
         if bid is None or ask is None: reasons.append("one-sided")
         else:
             try:
                 if Decimal(str(bid)) > Decimal(str(ask)): reasons.append("crossed")
-            except Exception: reasons.append("unverifiable price")
-        if not isinstance(bs, int) or not isinstance(ass, int) or bs <= 0 or ass <= 0:
+            except InvalidOperation: reasons.append("unverifiable price")
+        if not isinstance(bs, int) or not isinstance(az, int) or bs <= 0 or az <= 0:
             reasons.append("zero-size")
-    return Assessment(not reasons, tuple(dict.fromkeys(reasons)))
+    if packet.kind is EvidenceKind.OPTION_QUOTE:
+        if packet.feed.upper() != "OPRA": reasons.append("option quote is not OPRA")
+        for field in ("symbol", "underlying", "expiration", "strike", "right",
+                      "multiplier", "currency", "market"):
+            if n.get(field) in (None, ""): reasons.append(f"missing option {field}")
+    reasons = list(dict.fromkeys(reasons)); verified = packet.verify()
+    return Assessment(verified, verified and not reasons and not excluded,
+                      bool(reasons) and not excluded, excluded, tuple(reasons))
 
 
 class ReadOnlyMarketData(Protocol):
     def fetch(self, kind: EvidenceKind, request: Mapping[str, Any]) -> Any: ...
 
 
-@dataclass
 class AppendOnlyEvidenceStore:
-    """Content-addressed JSONL store: same ID/content is a no-op; mutation is rejected."""
-    path: Path
-    _seen: dict[str, str] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if self.path.exists():
-            for line in self.path.read_text().splitlines():
-                row = json.loads(line); self._seen[row["packet_id"]] = row["seal"]
+    """Atomic, locked JSONL replacement; duplicate IDs are compared byte-for-byte."""
+    def __init__(self, path: Path): self.path = path
 
     def append(self, packet: EvidencePacket) -> bool:
-        if not packet.verify(): raise ValueError("only verified sealed packets may be appended")
-        previous = self._seen.get(packet.packet_id)
-        if previous:
-            if previous != packet.seal: raise ValueError("packet ID collision/tampering")
-            return False
+        if not packet.verify(): raise ValueError("only verified content-addressed packets may be appended")
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as stream:
-            stream.write(canonical_json(packet.as_json()).decode() + "\n")
-        self._seen[packet.packet_id] = packet.seal
-        return True
+        lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        with lock_path.open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            rows = [json.loads(x) for x in self.path.read_text().splitlines()] if self.path.exists() else []
+            document = packet.as_json()
+            for row in rows:
+                if row["packet_id"] == packet.packet_id:
+                    if canonical_json(row) != canonical_json(document):
+                        raise ValueError("duplicate packet ID has different content")
+                    return False
+            rows.append(document)
+            fd, name = tempfile.mkstemp(dir=self.path.parent, prefix=self.path.name + ".")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    for row in rows: stream.write(canonical_json(row).decode() + "\n")
+                    stream.flush(); os.fsync(stream.fileno())
+                os.replace(name, self.path)
+            finally:
+                if os.path.exists(name): os.unlink(name)
+            return True
