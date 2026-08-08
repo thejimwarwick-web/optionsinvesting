@@ -182,8 +182,8 @@ class ResearchPacket(SealedRecord):
 
     def __post_init__(self) -> None:
         require_utc(self.research_at, "research_at")
-        if self.research_at.astimezone(LONDON).time().replace(tzinfo=None) != time(13, 30):
-            raise ValueError("research packet must be created at 13:30 Europe/London")
+        if self.research_at.astimezone(LONDON).time().replace(tzinfo=None) < time(13, 30):
+            raise ValueError("research packet cannot predate 13:30 Europe/London")
         if not self.packet_id or not self.shortlist or not self.rationale:
             raise ValueError("packet identity, shortlist and rationale are required")
         if any(o.available_at > self.research_at for o in self.observations):
@@ -201,8 +201,8 @@ class TradingDecision(SealedRecord):
 
     def __post_init__(self) -> None:
         require_utc(self.decision_at, "decision_at")
-        if self.decision_at.astimezone(LONDON).time().replace(tzinfo=None) != time(14, 40):
-            raise ValueError("trading decision must be created at 14:40 Europe/London")
+        if self.decision_at.astimezone(LONDON).time().replace(tzinfo=None) < time(14, 40):
+            raise ValueError("trading decision cannot predate 14:40 Europe/London")
         if any(o.available_at > self.decision_at for o in self.observations):
             raise ValueError("hindsight detected in trading decision")
 
@@ -217,5 +217,5 @@ class OrderSubmission:
     def __post_init__(self) -> None:
         require_utc(self.submitted_at, "submitted_at")
         require_utc(self.decision_at, "decision_at")
-        if self.submitted_at < self.decision_at:
-            raise ValueError("order submission cannot predate its decision")
+        if self.submitted_at <= self.decision_at:
+            raise ValueError("order submission cannot predate or equal its decision; it must follow")

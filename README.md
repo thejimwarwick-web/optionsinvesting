@@ -69,9 +69,57 @@ out-of-coverage, unverified, or seal-invalid evidence quarantines the event.
   authoritative calendar evidence before lifecycle processing can proceed.
 * Corporate-action terms remain quarantined until an external OCC-verification
   adapter supplies evidence.
-* FX values and market marks are caller-supplied, sealed inputs; there is no market
-  data retrieval. Taxes, fees, slippage beyond adverse-side fills, and dividends
-  are not accrued by this foundation.
+* Initial provider-response ingestion is separate from packet loading. Ingestion
+  creates a content-addressed ID and seals exactly once; loading preserves supplied
+  hashes and seals for verification and cannot silently reseal tampered evidence.
+  Atomic locked JSONL replacement prevents partial writes and rejects ID collisions.
+  The dependency-injected read port deliberately contains no network client,
+  credentials, broker submission, or Google Sheets writer.
+* SHA-256 content addressing and seals provide deterministic tamper evidence only.
+  They do **not** prove wall-clock creation time, authorship, or that an artifact
+  existed before later evidence was seen. Locally generated research, decision,
+  submission, and fill artifacts therefore declare `externally_attested: false`
+  and `launch_eligible: false`. External time/identity attestation is reserved for
+  a future append-only ledger adapter; local paper artifacts can never authorise
+  launch or be presented as externally time-proven.
+* Clock/calendar, underlying and option quotes/chains, corporate actions,
+  dividends, and GBP/USD are accepted as evidence kinds, but never synthesized.
+  Invalid, stale, future, mismatched, crossed, zero-size, or late evidence fails
+  closed. Corporate-action terms still require an external authoritative verifier.
+  Underlying and option quotes use the mandate quote-age limit. Calendar evidence
+  instead has to cover the actual trading session. Corporate-action and dividend
+  records require both an effective date and a retrieval timestamp, but are not
+  incorrectly subjected to a five-minute quote timeout. FX bid/ask and midpoint
+  must be finite and positive; FX size is optional because spot providers may not
+  publish it, while stock and option exchange sizes remain mandatory and positive.
+* Historical replay is explicitly excluded and cannot mutate launch status, cash,
+  NAV, orders, or positions. Taxes, fees, and slippage beyond adverse-side fills
+  are not accrued.
+
+## Offline sequential operational runs
+
+The operational path is deliberately three separate invocations. `research-run`
+seals its underlying-only input before option information is accepted;
+`decision-run` verifies that pre-existing artifact and writes distinct decision
+and submission artifacts; `fill-run` accepts only a separate post-submission OPRA
+quote. Multiple quote observations are retained and the latest available packet
+is selected deterministically; duplicate non-quote families are quarantined as
+ambiguous. Missing or malformed input produces a structured quarantine artifact.
+`replay` accepts combined historical bundles only as explicitly excluded,
+state-neutral test convenience. Every output says `PAPER ONLY` and `NO LIVE ORDER`:
+
+```bash
+value-options research-run research-input.json --at 2026-08-07T12:33:00Z --output artifacts/research.json
+value-options decision-run artifacts/research.json decision-evidence.json --at 2026-08-07T13:42:00Z --submitted-at 2026-08-07T13:42:01Z --decision-output artifacts/decision.json --submission-output artifacts/submission.json
+value-options fill-run artifacts/decision.json artifacts/submission.json post-submission-option-quote.json --as-of 2026-08-07T13:42:05Z --output artifacts/fill.json
+value-options replay evidence-bundle.json --as-of 2026-08-07T13:40:30Z --output artifacts/replay.json
+value-options inspect tests/fixtures/alpaca_opra_quote.json --as-of 2026-08-07T13:40:03Z --output artifacts/inspection.json
+```
+
+Operational commands exit non-zero whenever a research, decision, submission, or
+fill stage is quarantined, invalid, or non-actionable, so schedulers cannot mistake
+a written quarantine report for success. A valid inspection and a successfully
+excluded replay retain a zero exit status.
 
 ## Tests
 
