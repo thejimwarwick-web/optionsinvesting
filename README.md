@@ -69,9 +69,27 @@ out-of-coverage, unverified, or seal-invalid evidence quarantines the event.
   authoritative calendar evidence before lifecycle processing can proceed.
 * Corporate-action terms remain quarantined until an external OCC-verification
   adapter supplies evidence.
-* FX values and market marks are caller-supplied, sealed inputs; there is no market
-  data retrieval. Taxes, fees, slippage beyond adverse-side fills, and dividends
-  are not accrued by this foundation.
+* The provider-neutral ingestion port is read-only and dependency injected. It
+  persists canonical raw and normalized JSON, provider/feed (including IEX or
+  OPRA), request/timing metadata, and SHA-256 seals; it deliberately contains no
+  network client, credentials, broker submission, or Google Sheets writer.
+* Clock/calendar, underlying and option quotes/chains, corporate actions,
+  dividends, and GBP/USD are accepted as evidence kinds, but never synthesized.
+  Invalid, stale, future, mismatched, crossed, zero-size, or late evidence fails
+  closed. Corporate-action terms still require an external authoritative verifier.
+* Historical replay is explicitly excluded and cannot mutate launch status, cash,
+  NAV, orders, or positions. Taxes, fees, and slippage beyond adverse-side fills
+  are not accrued.
+
+## Offline operational dry runs
+
+Both commands emit a human summary and a deterministic JSON artifact prominently
+marked `PAPER ONLY` and `NO LIVE ORDER`:
+
+```bash
+value-options dry-run tests/fixtures/alpaca_opra_quote.json --output artifacts/dry-run.json
+value-options replay tests/fixtures/alpaca_opra_quote.json --output artifacts/replay.json
+```
 
 ## Tests
 

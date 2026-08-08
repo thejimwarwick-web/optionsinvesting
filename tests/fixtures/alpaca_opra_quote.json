@@ -1,0 +1,11 @@
+{
+  "packet_id": "alpaca-option-1",
+  "kind": "option_quote",
+  "provider": "alpaca",
+  "feed": "OPRA",
+  "request": {"symbol": "AAPL260821P00200000", "feed": "opra"},
+  "requested_at": "2026-08-07T13:40:01+00:00",
+  "received_at": "2026-08-07T13:40:03+00:00",
+  "raw": {"quote": {"bp": 4.1, "ap": 4.2, "bs": 10, "as": 12, "t": "2026-08-07T13:40:02+00:00"}},
+  "normalized": {"symbol": "AAPL260821P00200000", "bid": "4.10", "ask": "4.20", "bid_size": 10, "ask_size": 12, "timestamp": "2026-08-07T13:40:02+00:00", "expiration": "2026-08-21", "strike": "200", "feed": "OPRA"}
+}
