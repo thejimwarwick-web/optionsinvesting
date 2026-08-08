@@ -75,6 +75,13 @@ out-of-coverage, unverified, or seal-invalid evidence quarantines the event.
   Atomic locked JSONL replacement prevents partial writes and rejects ID collisions.
   The dependency-injected read port deliberately contains no network client,
   credentials, broker submission, or Google Sheets writer.
+* SHA-256 content addressing and seals provide deterministic tamper evidence only.
+  They do **not** prove wall-clock creation time, authorship, or that an artifact
+  existed before later evidence was seen. Locally generated research, decision,
+  submission, and fill artifacts therefore declare `externally_attested: false`
+  and `launch_eligible: false`. External time/identity attestation is reserved for
+  a future append-only ledger adapter; local paper artifacts can never authorise
+  launch or be presented as externally time-proven.
 * Clock/calendar, underlying and option quotes/chains, corporate actions,
   dividends, and GBP/USD are accepted as evidence kinds, but never synthesized.
   Invalid, stale, future, mismatched, crossed, zero-size, or late evidence fails
@@ -104,10 +111,15 @@ state-neutral test convenience. Every output says `PAPER ONLY` and `NO LIVE ORDE
 ```bash
 value-options research-run research-input.json --at 2026-08-07T12:33:00Z --output artifacts/research.json
 value-options decision-run artifacts/research.json decision-evidence.json --at 2026-08-07T13:42:00Z --submitted-at 2026-08-07T13:42:01Z --decision-output artifacts/decision.json --submission-output artifacts/submission.json
-value-options fill-run artifacts/submission.json post-submission-option-quote.json --as-of 2026-08-07T13:42:05Z --output artifacts/fill.json
+value-options fill-run artifacts/decision.json artifacts/submission.json post-submission-option-quote.json --as-of 2026-08-07T13:42:05Z --output artifacts/fill.json
 value-options replay evidence-bundle.json --as-of 2026-08-07T13:40:30Z --output artifacts/replay.json
 value-options inspect tests/fixtures/alpaca_opra_quote.json --as-of 2026-08-07T13:40:03Z --output artifacts/inspection.json
 ```
+
+Operational commands exit non-zero whenever a research, decision, submission, or
+fill stage is quarantined, invalid, or non-actionable, so schedulers cannot mistake
+a written quarantine report for success. A valid inspection and a successfully
+excluded replay retain a zero exit status.
 
 ## Tests
 

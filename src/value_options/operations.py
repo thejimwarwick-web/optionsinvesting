@@ -19,9 +19,11 @@ QUOTE_KINDS = frozenset({EvidenceKind.UNDERLYING_QUOTE, EvidenceKind.OPTION_QUOT
 
 
 def seal_artifact(kind: str, payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Create a content-addressed stage artifact. This is only a creation path."""
+    """Create local tamper evidence, not proof of time, author, or launch approval."""
     content = {"artifact_kind": kind, "payload": payload, "classification": "PAPER ONLY",
-               "order_policy": "NO LIVE ORDER"}
+               "order_policy": "NO LIVE ORDER", "externally_attested": False,
+               "launch_eligible": False, "verified": True, "actionable": True,
+               "quarantined": False}
     artifact_id = hashlib.sha256(canonical_json(content)).hexdigest()
     envelope = {"artifact_id": artifact_id, **content}
     return {**envelope, "seal": hashlib.sha256(canonical_json(envelope)).hexdigest()}
@@ -29,10 +31,14 @@ def seal_artifact(kind: str, payload: Mapping[str, Any]) -> dict[str, Any]:
 
 def verify_artifact(value: Mapping[str, Any], expected_kind: str) -> tuple[bool, tuple[str, ...]]:
     reasons = []
-    content = {k: value.get(k) for k in ("artifact_kind", "payload", "classification", "order_policy")}
+    content = {k: value.get(k) for k in ("artifact_kind", "payload", "classification", "order_policy",
+                                         "externally_attested", "launch_eligible", "verified",
+                                         "actionable", "quarantined")}
     expected_id = hashlib.sha256(canonical_json(content)).hexdigest()
     envelope = {"artifact_id": value.get("artifact_id"), **content}
     if value.get("artifact_kind") != expected_kind: reasons.append("wrong artifact kind")
+    if value.get("externally_attested") is not False: reasons.append("local artifact must be unattested")
+    if value.get("launch_eligible") is not False: reasons.append("local artifact must be launch-ineligible")
     if value.get("artifact_id") != expected_id: reasons.append("artifact ID is not content-addressed")
     if value.get("seal") != hashlib.sha256(canonical_json(envelope)).hexdigest(): reasons.append("artifact seal mismatch")
     return not reasons, tuple(reasons)

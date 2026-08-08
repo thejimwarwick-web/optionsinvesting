@@ -12,7 +12,7 @@ from value_options.mandate import DEFAULT_MANDATE
 from value_options.market_data import (AppendOnlyEvidenceStore, EvidenceKind, assess,
                                        ingest_response, load_packet)
 from value_options.models import AssetType, Instrument, OptionRight, Order, ResearchCandidate, Side
-from value_options.operations import PaperRun
+from value_options.operations import PaperRun, seal_artifact
 from value_options.risk import PortfolioRisk
 
 UTC = timezone.utc
@@ -148,12 +148,44 @@ def test_cli_sequential_artifacts(tmp_path, capsys):
     research_input=tmp_path/"research-input.json"; research_input.write_text(json.dumps({"candidates":[{"underlying":"AAPL","thesis":"value"}]}))
     research=tmp_path/"research.json"
     assert main(["research-run",str(research_input),"--at","2026-08-07T12:33:00+00:00","--output",str(research)]) == 0
+    research_value=json.loads(research.read_text())
+    assert research_value["externally_attested"] is False and research_value["launch_eligible"] is False
     decision,submission=tmp_path/"decision.json",tmp_path/"submission.json"
     assert main(["decision-run",str(research),str(path),"--at",DECISION.isoformat(),"--submitted-at",(DECISION+timedelta(seconds=1)).isoformat(),"--decision-output",str(decision),"--submission-output",str(submission)]) == 0
     assert json.loads(submission.read_text())["artifact_kind"] == "submission"
+    post_quote=packet(EvidenceKind.OPTION_QUOTE,timestamp=DECISION+timedelta(seconds=2))
+    quote_path=tmp_path/"post-quote.json"; quote_path.write_text(json.dumps(post_quote.as_json()))
+    fill=tmp_path/"fill.json"
+    assert main(["fill-run",str(decision),str(submission),str(quote_path),"--as-of",(post_quote.received_at+timedelta(seconds=1)).isoformat(),"--output",str(fill)]) == 0
+    assert json.loads(fill.read_text())["artifact_kind"] == "fill"
+    original=json.loads(submission.read_text())
+    for name,change in [("parent",{"decision_artifact_id":"substituted"}),
+                        ("order",{"order":{**original["payload"]["order"],"quantity":2}})]:
+        forged=seal_artifact("submission",{**original["payload"],**change}); forged_path=tmp_path/f"{name}.json"; forged_path.write_text(json.dumps(forged))
+        rejected=tmp_path/f"{name}-fill.json"
+        assert main(["fill-run",str(decision),str(forged_path),str(quote_path),"--as-of",(post_quote.received_at+timedelta(seconds=1)).isoformat(),"--output",str(rejected)]) != 0
+        assert json.loads(rejected.read_text())["quarantined"]
     replay=tmp_path/"replay.json"; main(["replay",str(path),"--as-of",DECISION.isoformat(),"--output",str(replay)])
     assert json.loads(replay.read_text())["excluded"]
     assert "PAPER ONLY | NO LIVE ORDER" in capsys.readouterr().out
+
+
+def test_quarantine_exit_is_nonzero_for_automation(tmp_path):
+    bad=tmp_path/"bad.json"; bad.write_text(json.dumps({"candidates":[{"underlying":"AAPL","thesis":"x","strike":"20"}]}))
+    output=tmp_path/"out.json"; env={**os.environ,"PYTHONPATH":"src"}
+    result=subprocess.run([sys.executable,"-m","value_options.cli","research-run",str(bad),"--at","2026-08-07T12:33:00+00:00","--output",str(output)],env=env)
+    assert result.returncode != 0 and json.loads(output.read_text())["quarantined"]
+
+
+@pytest.mark.parametrize("source", [
+    {"candidates":[{"underlying":"AAPL","thesis":"x"}],"unknown":True},
+    {"candidates":[{"underlying":"AAPL","thesis":"x","extra":"no"}]},
+    {"candidates":[{"underlying":"AAPL","thesis":"x"}],"evidence_references":[{"name":"q","value":"v","available_at":DECISION.isoformat(),"extra":"no"}]},
+])
+def test_research_schema_is_strict(tmp_path, source):
+    path=tmp_path/"input.json"; path.write_text(json.dumps(source)); output=tmp_path/"output.json"
+    assert main(["research-run",str(path),"--at","2026-08-07T12:33:00+00:00","--output",str(output)]) != 0
+    assert json.loads(output.read_text())["quarantined"]
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "NaN", "Infinity"])
