@@ -1,0 +1,13 @@
+"""Read-only broker boundary. No implementation, credentials, or order methods."""
+
+from typing import Protocol
+
+from .models import MarketQuote
+from .calendar import MarketCalendarEvidence
+
+
+class ReadOnlyAlpaca(Protocol):
+    def latest_quote(self, symbol: str) -> MarketQuote: ...
+    def positions(self) -> tuple[dict, ...]: ...
+    def account_snapshot(self) -> dict: ...
+    def calendar(self, start: str, end: str) -> MarketCalendarEvidence: ...
