@@ -164,8 +164,10 @@ def _verify_ledger_record(record):
 
 def portfolio_collect(source, *, initialize=False, expected_state=None):
     """Replay append-only paper-ledger records into a reconciled snapshot."""
-    if not isinstance(source,dict) or set(source)!={'records'} or not isinstance(source['records'],list): raise ValueError('paper ledger input schema mismatch')
+    if not isinstance(source,dict) or set(source)!={'records','record_count','head_record_id'} or not isinstance(source['records'],list): raise ValueError('paper ledger input schema mismatch')
     records=source['records']; ids=[]; cash=Decimal('0'); peak=Decimal('0'); positions={}; marks={}; pending={}; initialized=False
+    if source['record_count']!=len(records) or (records and source['head_record_id']!=records[-1].get('record_id')) or (not records and source['head_record_id']!=''):
+        raise ValueError('paper ledger history is missing or has the wrong head')
     def marked_nav():
         value=cash-sum((Decimal(x['reserved_cash_gbp']) for x in pending.values()),Decimal('0'))
         for instrument,row in positions.items(): value+=Decimal(row['quantity'])*instrument.multiplier*marks.get(instrument,Decimal('0'))
@@ -176,6 +178,13 @@ def portfolio_collect(source, *, initialize=False, expected_state=None):
         if record.get('sequence')!=expected_sequence or record.get('previous_record_id')!=previous: raise ValueError('ledger record ancestry reordered or missing')
         ids.append(record['record_id']); kind=record.get('kind')
         previous=record['record_id']
+        common={'record_id','seal','sequence','previous_record_id','kind'}
+        schemas={'portfolio_initialized':common|{'cash_gbp','nav_gbp','peak_nav_gbp'},
+            'cash':common|{'amount_gbp'},'position':common|{'instrument','quantity_delta','cost_basis_delta_gbp'},
+            'mark':common|{'instrument','mark_gbp'},'pending_submission':common|{'submission'},
+            'submission_resolved':common|{'submission_artifact_id'},
+            'valuation':common|{'nav_gbp','peak_nav_gbp'}}
+        if kind not in schemas or set(record)!=schemas[kind]: raise ValueError('paper ledger record schema mismatch')
         if kind=='portfolio_initialized':
             if initialized or record.get('cash_gbp')!='100000' or record.get('nav_gbp')!='100000' or record.get('peak_nav_gbp')!='100000': raise ValueError('invalid portfolio initialization record')
             cash=peak=Decimal('100000'); initialized=True
@@ -189,6 +198,7 @@ def portfolio_collect(source, *, initialize=False, expected_state=None):
             if before and after and before*after<0: raise ValueError('impossible position transition through zero')
             if instrument.asset_type is AssetType.EQUITY and after<0: raise ValueError('negative share quantity prohibited')
             if not cost.is_finite() or cost<0: raise ValueError('invalid position cost basis')
+            if after==0 and cost!=0: raise ValueError('closed position retains impossible cost basis')
             row['quantity']=after; row['cost_basis_gbp']=str(cost)
             if not row['quantity']: positions.pop(instrument)
         elif kind=='mark':
@@ -207,7 +217,6 @@ def portfolio_collect(source, *, initialize=False, expected_state=None):
             if stated!=computed: raise ValueError('valuation NAV disagrees with reconstructed state')
             peak=max(peak,computed)
             if stated_peak!=peak: raise ValueError('valuation peak NAV disagrees with reconstructed state')
-        else: raise ValueError('unknown paper ledger record kind')
     if not records:
         if not initialize: raise ValueError('empty ledger requires explicit initialization mode')
         bootstrap=seal_ledger_record({'kind':'portfolio_initialized','cash_gbp':'100000','nav_gbp':'100000','peak_nav_gbp':'100000'},sequence=0,previous_record_id='')
@@ -225,7 +234,17 @@ def portfolio_collect(source, *, initialize=False, expected_state=None):
                 shares=sum(x['quantity'] for i,x in positions.items() if i.asset_type is AssetType.EQUITY and i.symbol==instrument.underlying)
                 if shares<abs(row['quantity'])*instrument.multiplier: raise ValueError('uncovered short call in ledger')
             else: raise ValueError('invalid short option position')
+        elif row['quantity']>0 and instrument.asset_type is AssetType.OPTION:
+            raise ValueError('long option position prohibited by mandate')
     if put_collateral>cash: raise ValueError('unsecured short put in ledger')
+    if put_collateral+sum(Decimal(x['reserved_collateral_gbp']) for x in pending.values())>marked_nav()*DEFAULT_MANDATE.csp_collateral_limit:
+        raise ValueError('cash-secured-put collateral limit exceeded in ledger')
+    for instrument,row in positions.items():
+        if instrument.asset_type is AssetType.OPTION and instrument.right is OptionRight.CALL and row['quantity']<0:
+            shares=sum(x['quantity'] for i,x in positions.items() if i.asset_type is AssetType.EQUITY and i.symbol==instrument.underlying)
+            pending_cover=sum(int(x['covered_shares']) for x in pending.values() if x['instrument']['underlying']==instrument.underlying)
+            if abs(row['quantity'])*instrument.multiplier+pending_cover>int(shares*DEFAULT_MANDATE.covered_call_fraction):
+                raise ValueError('covered-call fraction exceeded in ledger')
     nav=marked_nav(); peak=max(peak,nav)
     initialization_mode=not source['records']
     payload={'nav_gbp':str(nav),'peak_nav_gbp':str(peak),'cash_gbp':str(cash),'positions':list(positions.values()),

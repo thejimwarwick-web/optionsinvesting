@@ -67,7 +67,7 @@ def attest(artifact,parents=()):
     return create_attested_artifact(artifact,receipt,artifact,parents=parents,trusted_attestor=TRUSTED)
 
 def portfolio_artifact():
-    artifact=portfolio_collect({'records':[]},initialize=True)
+    artifact=portfolio_collect(ledger_source([]),initialize=True)
     return attest(artifact).as_json()
 
 
@@ -75,6 +75,9 @@ def seal_history(rows):
     result=[]
     for sequence,row in enumerate(rows): result.append(seal_ledger_record(row,sequence=sequence,previous_record_id=result[-1]['record_id'] if result else ''))
     return result
+
+def ledger_source(records):
+    return {'records':records,'record_count':len(records),'head_record_id':records[-1]['record_id'] if records else ''}
 
 def collect_research(tmp_path,clock,providers):
     source=tmp_path/'candidates.json'; out=tmp_path/'research.json'; write(source,{'candidates':[{'underlying':'AAPL','thesis':'value'}]})
@@ -198,7 +201,7 @@ def test_production_calendar_is_timestamp_free_and_assesses_session_coverage():
 def test_public_commands_produce_complete_envelopes_end_to_end(tmp_path):
     boundary=SheetAttestationBoundary(MemorySheet(),provenance='test-authenticated')
     snapshot_input=tmp_path/'snapshot-input.json'; portfolio=tmp_path/'portfolio-envelope.json'
-    write(snapshot_input,{'records':[]})
+    write(snapshot_input,ledger_source([]))
     clock=TickClock(datetime(2026,8,7,12,30,tzinfo=UTC))
     assert main(['portfolio-collect',str(snapshot_input),'--initialize','--output',str(portfolio)],
         utc_clock=clock,sheet_boundary=boundary,trusted_attestor=TRUSTED)==0
@@ -234,7 +237,7 @@ def test_portfolio_collect_replays_nonempty_ledger_and_rejects_disagreement(tmp_
         {'record_id':'position-1','kind':'position','instrument':equity,'quantity_delta':10,'cost_basis_delta_gbp':'1000'},
         {'record_id':'mark-1','kind':'mark','instrument':equity,'mark_gbp':'110'},
         {'record_id':'valuation-1','kind':'valuation','nav_gbp':'100100','peak_nav_gbp':'100100'}]}
-    ledger={'records':seal_history(ledger['records'])}
+    ledger=ledger_source(seal_history(ledger['records']))
     source=tmp_path/'ledger.json'; output=tmp_path/'portfolio.json'; write(source,ledger)
     clock=TickClock(AT)
     assert main(['portfolio-collect',str(source),'--output',str(output)],utc_clock=clock,
@@ -266,7 +269,7 @@ def test_ledger_replay_rejects_falsified_nav_negative_shares_and_cost_basis():
         [init,{'kind':'position','instrument':equity,'quantity_delta':-1,'cost_basis_delta_gbp':'0'}],
         [init,{'kind':'position','instrument':equity,'quantity_delta':1,'cost_basis_delta_gbp':'-1'}]]
     for rows in cases:
-        with pytest.raises(ValueError): portfolio_collect({'records':seal_history(rows)})
+        with pytest.raises(ValueError): portfolio_collect(ledger_source(seal_history(rows)))
 
 
 def test_ledger_replay_rejects_duplicate_pending_and_altered_history():
@@ -274,9 +277,13 @@ def test_ledger_replay_rejects_duplicate_pending_and_altered_history():
         'reserved_cash_gbp':'0','reserved_collateral_gbp':'2000','covered_shares':0,'submission_artifact_id':'submission-1'}
     history=seal_history([{'kind':'portfolio_initialized','cash_gbp':'100000','nav_gbp':'100000','peak_nav_gbp':'100000'}, {'kind':'pending_submission','submission':submission}, {'kind':'pending_submission','submission':submission}])
     with pytest.raises(ValueError,match='duplicate pending'):
-        portfolio_collect({'records':history})
+        portfolio_collect(ledger_source(history))
     altered=dict(history[1]); altered['submission']={**submission,'quantity':2}
     with pytest.raises(ValueError,match='altered'):
-        portfolio_collect({'records':[history[0],altered]})
+        portfolio_collect(ledger_source([history[0],altered]))
     with pytest.raises(ValueError,match='reordered'):
-        portfolio_collect({'records':[history[0],history[2],history[1]]})
+        portfolio_collect(ledger_source([history[0],history[2],history[1]]))
+    missing=ledger_source(history[:-1]); missing['record_count']=len(history)
+    missing['head_record_id']=history[-1]['record_id']
+    with pytest.raises(ValueError,match='missing'):
+        portfolio_collect(missing)
