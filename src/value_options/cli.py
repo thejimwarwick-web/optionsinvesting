@@ -84,7 +84,7 @@ def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary
     parser=argparse.ArgumentParser(prog="value-options",allow_abbrev=False); sub=parser.add_subparsers(dest="command",required=True)
     i=sub.add_parser("inspect"); i.add_argument("packet",type=Path); i.add_argument("--as-of",required=True); i.add_argument("--output",type=Path,required=True)
     r=sub.add_parser("research-run"); r.add_argument("input",type=Path); r.add_argument("--at",required=True); r.add_argument("--output",type=Path,required=True)
-    pc=sub.add_parser("portfolio-collect",allow_abbrev=False); pc.add_argument("input",type=Path); pc.add_argument("--output",type=Path,required=True); pc.add_argument("--checkpoint",type=Path)
+    pc=sub.add_parser("portfolio-collect",allow_abbrev=False); pc.add_argument("input",type=Path); pc.add_argument("--initialize",action="store_true"); pc.add_argument("--expected-state",type=Path); pc.add_argument("--output",type=Path,required=True); pc.add_argument("--checkpoint",type=Path)
     rc=sub.add_parser("research-collect",allow_abbrev=False); rc.add_argument("input",type=Path); rc.add_argument("--output",type=Path,required=True); rc.add_argument("--checkpoint",type=Path); rc.add_argument("--attestation-output",type=Path)
     d=sub.add_parser("decision-run"); d.add_argument("research",type=Path); d.add_argument("bundle",type=Path); d.add_argument("--at",required=True); d.add_argument("--submitted-at",required=True); d.add_argument("--decision-output",type=Path,required=True); d.add_argument("--submission-output",type=Path,required=True)
     dc=sub.add_parser("decision-collect",allow_abbrev=False); dc.add_argument("research",type=Path); dc.add_argument("portfolio",type=Path); dc.add_argument("proposal",type=Path); dc.add_argument("--decision-output",type=Path,required=True); dc.add_argument("--submission-output",type=Path,required=True); dc.add_argument("--checkpoint",type=Path); dc.add_argument("--attestation-output",type=Path)
@@ -109,7 +109,7 @@ def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary
             if args.command!='portfolio-collect' and collection_providers is None:
                 from .providers import production_provider_factory
                 collection_providers=production_provider_factory()
-            inputs=[_read(args.input)] if args.command in {'portfolio-collect','research-collect'} else ([ _read(args.research),_read(args.portfolio),_read(args.proposal)] if args.command=='decision-collect' else [_read(args.research),_read(args.portfolio),_read(args.decision),_read(args.submission)])
+            inputs=([_read(args.input),_read(args.expected_state) if args.expected_state else None] if args.command=='portfolio-collect' else ([_read(args.input)] if args.command=='research-collect' else ([_read(args.research),_read(args.portfolio),_read(args.proposal)] if args.command=='decision-collect' else [_read(args.research),_read(args.portfolio),_read(args.decision),_read(args.submission)])))
             bindings={"command_kind":args.command,"canonical_input_hash":hashlib.sha256(canonical_json(inputs)).hexdigest(),"parent_artifact_ids":[x.get('local_artifact_id') for x in inputs if isinstance(x,dict) and x.get('local_artifact_id')],"mandate_version":DEFAULT_MANDATE.version,"provider_policy_version":"read-only-v1"}
             checkpoint=AtomicCheckpoint(args.checkpoint,bindings) if args.checkpoint else None
             recovered=checkpoint.read() if checkpoint else {}
@@ -121,7 +121,13 @@ def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary
                     decision_envelope=load_attested_artifact(recovered['decision_envelope'])
                     if not verify_attested_artifact(decision_envelope,trusted_attestor=trusted_attestor).verified: raise ValueError('recovered decision envelope invalid')
             elif args.command=='portfolio-collect':
-                local=portfolio_collect(inputs[0]); envelope=sheet_boundary.append_envelope(local,utc_clock(),trusted_attestor=trusted_attestor)
+                if args.initialize:
+                    from .sheets import SheetRecord
+                    for row in sheet_boundary.port.read_all():
+                        prior=json.loads(SheetRecord.from_row(row).payload_json)
+                        if prior.get('artifact_kind')=='portfolio_snapshot':
+                            raise ValueError('portfolio initialization already exists in append-only ledger')
+                local=portfolio_collect(inputs[0],initialize=args.initialize,expected_state=inputs[1]); envelope=sheet_boundary.append_envelope(local,utc_clock(),trusted_attestor=trusted_attestor)
             elif args.command=='research-collect':
                 local=research_collect(inputs[0],collection_providers,utc_clock); envelope=sheet_boundary.append_envelope(local,utc_clock(),trusted_attestor=trusted_attestor)
             elif args.command=='decision-collect':

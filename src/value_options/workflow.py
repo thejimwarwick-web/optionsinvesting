@@ -62,11 +62,15 @@ def collect_packet(kind,call,clock,request):
     started=_now(clock); result=call(); received=_now(clock)
     if not isinstance(result,ReadResult): raise ValueError(f'{kind.value} provider returned malformed response')
     n=dict(result.normalized)
-    if kind is not EvidenceKind.CALENDAR:
+    timestamp_optional=(kind is EvidenceKind.CALENDAR or
+        kind in {EvidenceKind.CORPORATE_ACTION,EvidenceKind.DIVIDEND} and n.get('negative_evidence') is True)
+    if not timestamp_optional:
         if not isinstance(n.get('timestamp'),str): raise ValueError(f'{kind.value} provider observation timestamp unavailable')
         try: observed=_time(n['timestamp'])
         except (TypeError,ValueError): raise ValueError(f'{kind.value} provider observation timestamp malformed') from None
         if observed>received: raise ValueError(f'{kind.value} provider observation is after response receipt')
+    if timestamp_optional and kind in {EvidenceKind.CORPORATE_ACTION,EvidenceKind.DIVIDEND}:
+        n['retrieved_at']=received.isoformat()
     packet=ingest_response(kind=kind,provider=result.provider,feed=result.feed,request={**request,'request_started_at':started.isoformat()},requested_at=started,received_at=received,raw=result.raw,normalized=n)
     return packet
 
@@ -110,7 +114,9 @@ def portfolio_from_artifact(supplied, trusted_attestor=None):
     return _portfolio_payload(p)
 
 def _portfolio_payload(p):
-    if set(p)!={'nav_gbp','peak_nav_gbp','cash_gbp','positions','pending_submissions'}: raise ValueError('portfolio snapshot schema mismatch')
+    required={'nav_gbp','peak_nav_gbp','cash_gbp','positions','pending_submissions',
+              'drawdown','source_ledger_record_ids','initialization_mode'}
+    if set(p)!=required: raise ValueError('portfolio snapshot schema mismatch')
     positions={}; marks={}
     for row in p['positions']:
         if set(row)!={'instrument','quantity','cost_basis_gbp','mark_gbp'}: raise ValueError('portfolio position schema mismatch')
@@ -131,12 +137,50 @@ def _portfolio_payload(p):
         if covered: pending_covered[instrument.underlying]=pending_covered.get(instrument.underlying,0)+covered
     nav,peak,cash=Decimal(p['nav_gbp']),Decimal(p['peak_nav_gbp']),Decimal(p['cash_gbp'])
     if any(not x.is_finite() or x<0 for x in (nav,peak,cash)) or nav==0 or peak<nav: raise ValueError('invalid portfolio cash or NAV')
+    drawdown=max(Decimal('0'),(peak-nav)/peak)
+    if Decimal(p['drawdown'])!=drawdown: raise ValueError('portfolio drawdown mismatch')
+    refs=p['source_ledger_record_ids']
+    if not isinstance(refs,list) or len(refs)!=len(set(refs)) or any(not isinstance(x,str) or not x for x in refs): raise ValueError('invalid source ledger references')
+    if not isinstance(p['initialization_mode'],bool): raise ValueError('invalid initialization mode')
     return PortfolioRisk(nav,peak,cash,positions,marks,pending_cash,pending_collateral,pending_covered)
 
-def portfolio_collect(source):
-    """Validate and seal a portfolio snapshot before external append/read-back."""
-    _portfolio_payload(source)
-    return seal_artifact('portfolio_snapshot',source)
+def portfolio_collect(source, *, initialize=False, expected_state=None):
+    """Replay append-only paper-ledger records into a reconciled snapshot."""
+    if not isinstance(source,dict) or set(source)!={'records'} or not isinstance(source['records'],list): raise ValueError('paper ledger input schema mismatch')
+    records=source['records']; ids=[]; cash=Decimal('0'); nav=peak=Decimal('0'); positions={}; marks={}; pending={}; initialized=False
+    for record in records:
+        if not isinstance(record,dict) or not record.get('record_id') or record['record_id'] in ids: raise ValueError('invalid or duplicate ledger record')
+        ids.append(record['record_id']); kind=record.get('kind')
+        if kind=='portfolio_initialized':
+            if initialized or record.get('cash_gbp')!='100000' or record.get('nav_gbp')!='100000' or record.get('peak_nav_gbp')!='100000': raise ValueError('invalid portfolio initialization record')
+            cash=nav=peak=Decimal('100000'); initialized=True
+        elif not initialized: raise ValueError('ledger history lacks initialization')
+        elif kind=='cash': cash+=Decimal(record['amount_gbp'])
+        elif kind=='position':
+            instrument=_instrument(record['instrument']); row=positions.setdefault(instrument,{'instrument':record['instrument'],'quantity':0,'cost_basis_gbp':'0','mark_gbp':'0'})
+            row['quantity']+=int(record['quantity_delta']); row['cost_basis_gbp']=str(Decimal(row['cost_basis_gbp'])+Decimal(record.get('cost_basis_delta_gbp','0')))
+            if not row['quantity']: positions.pop(instrument)
+        elif kind=='mark':
+            instrument=_instrument(record['instrument']); marks[instrument]=Decimal(record['mark_gbp'])
+        elif kind=='pending_submission': pending[record['submission']['submission_artifact_id']]=record['submission']
+        elif kind=='submission_resolved':
+            if record['submission_artifact_id'] not in pending: raise ValueError('unknown pending submission resolution')
+            pending.pop(record['submission_artifact_id'])
+        elif kind=='valuation': nav=Decimal(record['nav_gbp']); peak=max(peak,Decimal(record['peak_nav_gbp']))
+        else: raise ValueError('unknown paper ledger record kind')
+    if not records:
+        if not initialize: raise ValueError('empty ledger requires explicit initialization mode')
+        ids=['bootstrap:gbp100000']; cash=nav=peak=Decimal('100000'); initialized=True
+    elif initialize: raise ValueError('initialization mode is one-time and requires an empty ledger')
+    for instrument,row in positions.items():
+        if instrument not in marks: raise ValueError('position is missing a ledger mark')
+        row['mark_gbp']=str(marks[instrument])
+    payload={'nav_gbp':str(nav),'peak_nav_gbp':str(peak),'cash_gbp':str(cash),'positions':list(positions.values()),
+        'pending_submissions':list(pending.values()),'drawdown':str(max(Decimal('0'),(peak-nav)/peak)),
+        'source_ledger_record_ids':ids,'initialization_mode':not records}
+    _portfolio_payload(payload)
+    if expected_state is not None and canonical_json(expected_state)!=canonical_json(payload): raise ValueError('supplied state disagrees with reconstructed ledger state')
+    return seal_artifact('portfolio_snapshot',payload)
 def _evidence_refs(packets): return [{'name':p.kind.value,'value':p.packet_id,'available_at':p.received_at.isoformat(),'request_started_at':p.requested_at.isoformat(),'provider_observed_at':p.normalized.get('timestamp')} for p in packets]
 
 def research_collect(source,providers,clock):

@@ -120,7 +120,9 @@ def assess(packet: EvidencePacket, *, as_of: datetime, cutoff: datetime,
     except ValueError: timestamp = None
     # Calendars describe session coverage, not a point-in-time market observation.
     # Their provenance is bounded by requested_at/received_at instead.
-    if timestamp is None and packet.kind is not EvidenceKind.CALENDAR: reasons.append("missing timestamp")
+    timestamp_optional=(packet.kind is EvidenceKind.CALENDAR or
+        packet.kind in {EvidenceKind.CORPORATE_ACTION,EvidenceKind.DIVIDEND} and n.get("negative_evidence") is True)
+    if timestamp is None and not timestamp_optional: reasons.append("missing timestamp")
     elif timestamp is not None:
         if timestamp > as_of: reasons.append("future-dated")
         if timestamp > cutoff: reasons.append("observed post-cutoff")

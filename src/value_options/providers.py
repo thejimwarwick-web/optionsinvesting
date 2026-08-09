@@ -69,30 +69,31 @@ class ProductionCollectionProviders:
         response=self.transport.request('GET',url,headers={'Accept':'application/json',
             'APCA-API-KEY-ID':self.credentials[0],'APCA-API-SECRET-KEY':self.credentials[1]},body=None)
         if response.status!=200 or response.url!=url: raise ExternalServiceError(name+' evidence request failed')
-        try: raw=json.loads(response.body)
+        try: provider_raw=json.loads(response.body)
         except Exception: raise ExternalServiceError(name+' evidence response malformed') from None
+        request_id=response.headers.get('x-request-id') or response.headers.get('X-Request-ID')
+        if not request_id: raise ExternalServiceError(name+' evidence response omitted request ID')
+        raw={'request':query,'request_id':request_id,'response':provider_raw}
         if name=='fx':
-            if not isinstance(raw,Mapping) or len(raw.get('quotes',{}))!=1: raise ExternalServiceError('fx evidence response malformed')
-            symbol,q=next(iter(raw['quotes'].items()))
+            if not isinstance(provider_raw,Mapping) or len(provider_raw.get('quotes',{}))!=1: raise ExternalServiceError('fx evidence response malformed')
+            symbol,q=next(iter(provider_raw['quotes'].items()))
             if symbol.replace('/','')!='GBPUSD' or parameter!='GBPUSD': raise ExternalServiceError('fx evidence response mismatched request')
             bid,ask=q.get('bp'),q.get('ap'); normalized={'symbol':'GBPUSD','timestamp':q.get('t'),
                 'bid':bid,'ask':ask,'mid':str((float(bid)+float(ask))/2)}
         else:
-            rows=raw.get('corporate_actions') if isinstance(raw,Mapping) else None
+            rows=provider_raw.get('corporate_actions') if isinstance(provider_raw,Mapping) else None
             if not isinstance(rows,list): raise ExternalServiceError(name+' evidence response malformed')
             matched=[x for x in rows if isinstance(x,Mapping) and x.get('symbol')==parameter]
             if not matched and rows: raise ExternalServiceError(name+' evidence response mismatched request')
             if not matched:
-                if raw.get('symbol')!=parameter or raw.get('start')!=coverage or raw.get('end')!=coverage or not raw.get('as_of'):
-                    raise ExternalServiceError(name+' negative evidence lacks authenticated coverage')
-                normalized={'symbol':parameter,'timestamp':raw['as_of'],'retrieved_at':raw['as_of'],
-                    'effective_date':coverage,'coverage_start':coverage,'coverage_end':coverage,'records':[],'negative_evidence':True}
+                normalized={'symbol':parameter,'effective_date':coverage,'coverage_start':coverage,
+                    'coverage_end':coverage,'records':[],'negative_evidence':True,'request_id':request_id}
             else:
                 latest=max(matched,key=lambda x:x.get('updated_at','')); normalized={'symbol':parameter,
                     'timestamp':latest.get('updated_at'),'retrieved_at':latest.get('updated_at'),
                     'effective_date':latest.get('ex_date') or latest.get('effective_date'),
                     'coverage_start':coverage,'coverage_end':coverage,'records':matched,'negative_evidence':False}
-        return ReadResult('alpaca',str(raw.get('feed',name)),raw,normalized)
+        return ReadResult('alpaca',name,raw,normalized)
     def corporate_action(self,underlying): return self._aux('corporate_action',underlying)
     def dividend(self,underlying): return self._aux('dividend',underlying)
     def fx(self,pair): return self._aux('fx',pair)

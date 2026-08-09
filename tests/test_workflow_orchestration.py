@@ -35,6 +35,13 @@ class Providers:
     def dividend(self,u): return self._result('dividend',effective_date='2026-08-07',retrieved_at=self.ticker.value.isoformat())
     def fx(self,p): return self._result('fx',symbol=p,bid='0.79',ask='0.81',mid='0.8')
 
+class EmptyCorporateProviders(Providers):
+    def _negative(self,name,u): return ReadResult('alpaca',name,
+        {'request':{'symbols':u,'start':'2026-08-07','end':'2026-08-07'},'request_id':'r-'+name,'response':{'corporate_actions':[]}},
+        {'symbol':u,'effective_date':'2026-08-07','coverage_start':'2026-08-07','coverage_end':'2026-08-07','records':[],'negative_evidence':True,'request_id':'r-'+name})
+    def corporate_action(self,u): return self._negative('corporate_action',u)
+    def dividend(self,u): return self._negative('dividend',u)
+
 class MemorySheet:
     def __init__(self): self.rows=[]; self.reads=0; self.fail_read=False
     def read_all(self): return tuple(self.rows)
@@ -60,7 +67,7 @@ def attest(artifact,parents=()):
     return create_attested_artifact(artifact,receipt,artifact,parents=parents,trusted_attestor=TRUSTED)
 
 def portfolio_artifact():
-    artifact=seal_artifact('portfolio_snapshot',{'nav_gbp':'100000','peak_nav_gbp':'100000','cash_gbp':'100000','positions':[],'pending_submissions':[]})
+    artifact=seal_artifact('portfolio_snapshot',{'nav_gbp':'100000','peak_nav_gbp':'100000','cash_gbp':'100000','positions':[],'pending_submissions':[],'drawdown':'0','source_ledger_record_ids':['bootstrap:gbp100000'],'initialization_mode':True})
     return attest(artifact).as_json()
 
 def collect_research(tmp_path,clock,providers):
@@ -185,10 +192,9 @@ def test_production_calendar_is_timestamp_free_and_assesses_session_coverage():
 def test_public_commands_produce_complete_envelopes_end_to_end(tmp_path):
     boundary=SheetAttestationBoundary(MemorySheet(),provenance='test-authenticated')
     snapshot_input=tmp_path/'snapshot-input.json'; portfolio=tmp_path/'portfolio-envelope.json'
-    write(snapshot_input,{'nav_gbp':'100000','peak_nav_gbp':'100000','cash_gbp':'100000',
-        'positions':[],'pending_submissions':[]})
+    write(snapshot_input,{'records':[]})
     clock=TickClock(datetime(2026,8,7,12,30,tzinfo=UTC))
-    assert main(['portfolio-collect',str(snapshot_input),'--output',str(portfolio)],
+    assert main(['portfolio-collect',str(snapshot_input),'--initialize','--output',str(portfolio)],
         utc_clock=clock,sheet_boundary=boundary,trusted_attestor=TRUSTED)==0
     source=tmp_path/'research-input.json'; research=tmp_path/'research-envelope.json'
     write(source,{'candidates':[{'underlying':'AAPL','thesis':'value'}]})
@@ -199,7 +205,7 @@ def test_public_commands_produce_complete_envelopes_end_to_end(tmp_path):
     write(operation,proposal())
     assert main(['decision-collect',str(research),str(portfolio),str(operation),
         '--decision-output',str(decision),'--submission-output',str(submission)],
-        collection_providers=Providers(clock),utc_clock=clock,sheet_boundary=boundary,trusted_attestor=TRUSTED)==0
+        collection_providers=EmptyCorporateProviders(clock),utc_clock=clock,sheet_boundary=boundary,trusted_attestor=TRUSTED)==0
     fill=tmp_path/'fill-envelope.json'
     assert main(['fill-collect',str(research),str(portfolio),str(decision),str(submission),'--output',str(fill)],
         collection_providers=Providers(clock),utc_clock=clock,sheet_boundary=boundary,trusted_attestor=TRUSTED)==0
@@ -209,3 +215,35 @@ def test_public_commands_produce_complete_envelopes_end_to_end(tmp_path):
     assert values[2]['parent_artifact_ids']==[values[1]['local_artifact_id']]
     assert values[3]['parent_artifact_ids']==[values[2]['local_artifact_id']]
     assert values[4]['parent_artifact_ids']==[values[3]['local_artifact_id']]
+
+
+def test_portfolio_collect_replays_nonempty_ledger_and_rejects_disagreement(tmp_path):
+    boundary=SheetAttestationBoundary(MemorySheet(),provenance='test-authenticated')
+    equity={'symbol':'AAPL','asset_type':'equity','issuer':'Apple','sector':'Technology',
+        'market':'US','currency':'USD','is_etf':False,'underlying':None,'expiration':None,
+        'strike':None,'right':None,'multiplier':1,'adjusted':False,'occ_verified':True}
+    ledger={'records':[
+        {'record_id':'init','kind':'portfolio_initialized','cash_gbp':'100000','nav_gbp':'100000','peak_nav_gbp':'100000'},
+        {'record_id':'cash-1','kind':'cash','amount_gbp':'-1000'},
+        {'record_id':'position-1','kind':'position','instrument':equity,'quantity_delta':10,'cost_basis_delta_gbp':'1000'},
+        {'record_id':'mark-1','kind':'mark','instrument':equity,'mark_gbp':'110'},
+        {'record_id':'valuation-1','kind':'valuation','nav_gbp':'100100','peak_nav_gbp':'100100'}]}
+    source=tmp_path/'ledger.json'; output=tmp_path/'portfolio.json'; write(source,ledger)
+    clock=TickClock(AT)
+    assert main(['portfolio-collect',str(source),'--output',str(output)],utc_clock=clock,
+        sheet_boundary=boundary,trusted_attestor=TRUSTED)==0
+    payload=json.loads(output.read_text())['original_artifact']['payload']
+    assert payload['cash_gbp']=='99000' and payload['positions'][0]['quantity']==10
+    assert payload['source_ledger_record_ids']==['init','cash-1','position-1','mark-1','valuation-1']
+    expected=tmp_path/'expected.json'; write(expected,{**payload,'cash_gbp':'1'})
+    rejected=tmp_path/'rejected.json'
+    assert main(['portfolio-collect',str(source),'--expected-state',str(expected),'--output',str(rejected)],
+        utc_clock=clock,sheet_boundary=boundary,trusted_attestor=TRUSTED)==1
+
+
+def test_negative_corporate_evidence_needs_no_nonstandard_response_fields():
+    clock=TickClock(datetime(2026,8,7,13,40,tzinfo=UTC)); provider=EmptyCorporateProviders(clock)
+    ca=collect_packet(EvidenceKind.CORPORATE_ACTION,lambda:provider.corporate_action('AAPL'),clock,{'underlying':'AAPL'})
+    div=collect_packet(EvidenceKind.DIVIDEND,lambda:provider.dividend('AAPL'),clock,{'underlying':'AAPL'})
+    assert ca.normalized['negative_evidence'] and div.normalized['negative_evidence']
+    assert ca.raw['response']=={'corporate_actions':[]} and div.raw['response']=={'corporate_actions':[]}

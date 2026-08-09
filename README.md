@@ -230,13 +230,15 @@ instead of appending another.
 ```bash
 value-options workflow-preflight                         # configuration only
 value-options workflow-preflight --live-read-only       # activated provider/schema reads
-value-options portfolio-collect portfolio-snapshot-input.json --output artifacts/portfolio-snapshot.json
+value-options portfolio-collect paper-ledger.json --initialize --output artifacts/portfolio-snapshot.json  # one-time empty-ledger bootstrap
 value-options research-collect research-input.json --output artifacts/research.json --checkpoint state/research.json
 value-options decision-collect artifacts/research.json artifacts/portfolio-snapshot.json proposed-operation.json --decision-output artifacts/decision.json --submission-output artifacts/submission.json --checkpoint state/decision.json
 value-options fill-collect artifacts/research.json artifacts/portfolio-snapshot.json artifacts/decision.json artifacts/submission.json --output artifacts/fill.json --checkpoint state/fill.json
 value-options workflow-rehearsal evidence-bundle.json --state fund-state.json --as-of 2026-08-07T13:40:30Z --output artifacts/rehearsal.json
 value-options inspect tests/fixtures/alpaca_opra_quote.json --as-of 2026-08-07T13:40:03Z --output artifacts/inspection.json
 ```
+
+`portfolio-collect` never accepts an operator-authored replacement snapshot. It deterministically replays append-only ledger records for initialization, cash, positions, marks, valuations, and pending-submission/resolution events; `--initialize` is accepted only once against an empty ledger and creates the £100,000 bootstrap. The sealed snapshot retains every source record ID and may be compared with `--expected-state` for reconciliation.
 
 The collect commands enforce externally attested research → trusted, externally attested portfolio-snapshot envelope → externally attested decision → externally attested submission → fill ancestry; local artifacts fail closed at prospective boundaries. Portfolio snapshots reconstruct actual cash, NAV, peak NAV/drawdown, holdings, option shorts and marks, so existing CSP collateral, covered calls, and issuer/sector usage enter the authoritative risk calculation.
 Research accepts only underlying/thesis pairs; prospective code obtains clock,
