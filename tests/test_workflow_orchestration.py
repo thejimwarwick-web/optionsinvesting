@@ -10,7 +10,7 @@ from value_options.market_data import EvidenceKind, canonical_json
 import hashlib
 from value_options.sheets import GoogleSheetsAdapter, HEADERS, SheetAttestationBoundary
 from value_options.workflow import ReadResult
-from value_options.workflow import AtomicCheckpoint, collect_packet
+from value_options.workflow import AtomicCheckpoint, collect_packet, portfolio_collect, seal_ledger_record
 
 UTC=timezone.utc; CONTRACT='AAPL260828P00020000'; AT=datetime(2026,8,7,12,30,tzinfo=UTC)
 
@@ -67,8 +67,14 @@ def attest(artifact,parents=()):
     return create_attested_artifact(artifact,receipt,artifact,parents=parents,trusted_attestor=TRUSTED)
 
 def portfolio_artifact():
-    artifact=seal_artifact('portfolio_snapshot',{'nav_gbp':'100000','peak_nav_gbp':'100000','cash_gbp':'100000','positions':[],'pending_submissions':[],'drawdown':'0','source_ledger_record_ids':['bootstrap:gbp100000'],'initialization_mode':True})
+    artifact=portfolio_collect({'records':[]},initialize=True)
     return attest(artifact).as_json()
+
+
+def seal_history(rows):
+    result=[]
+    for sequence,row in enumerate(rows): result.append(seal_ledger_record(row,sequence=sequence,previous_record_id=result[-1]['record_id'] if result else ''))
+    return result
 
 def collect_research(tmp_path,clock,providers):
     source=tmp_path/'candidates.json'; out=tmp_path/'research.json'; write(source,{'candidates':[{'underlying':'AAPL','thesis':'value'}]})
@@ -228,13 +234,14 @@ def test_portfolio_collect_replays_nonempty_ledger_and_rejects_disagreement(tmp_
         {'record_id':'position-1','kind':'position','instrument':equity,'quantity_delta':10,'cost_basis_delta_gbp':'1000'},
         {'record_id':'mark-1','kind':'mark','instrument':equity,'mark_gbp':'110'},
         {'record_id':'valuation-1','kind':'valuation','nav_gbp':'100100','peak_nav_gbp':'100100'}]}
+    ledger={'records':seal_history(ledger['records'])}
     source=tmp_path/'ledger.json'; output=tmp_path/'portfolio.json'; write(source,ledger)
     clock=TickClock(AT)
     assert main(['portfolio-collect',str(source),'--output',str(output)],utc_clock=clock,
         sheet_boundary=boundary,trusted_attestor=TRUSTED)==0
     payload=json.loads(output.read_text())['original_artifact']['payload']
     assert payload['cash_gbp']=='99000' and payload['positions'][0]['quantity']==10
-    assert payload['source_ledger_record_ids']==['init','cash-1','position-1','mark-1','valuation-1']
+    assert len(payload['source_ledger_record_ids'])==5 and [x['kind'] for x in payload['source_ledger_records']]==['portfolio_initialized','cash','position','mark','valuation']
     expected=tmp_path/'expected.json'; write(expected,{**payload,'cash_gbp':'1'})
     rejected=tmp_path/'rejected.json'
     assert main(['portfolio-collect',str(source),'--expected-state',str(expected),'--output',str(rejected)],
@@ -247,3 +254,29 @@ def test_negative_corporate_evidence_needs_no_nonstandard_response_fields():
     div=collect_packet(EvidenceKind.DIVIDEND,lambda:provider.dividend('AAPL'),clock,{'underlying':'AAPL'})
     assert ca.normalized['negative_evidence'] and div.normalized['negative_evidence']
     assert ca.raw['response']=={'corporate_actions':[]} and div.raw['response']=={'corporate_actions':[]}
+
+
+def test_ledger_replay_rejects_falsified_nav_negative_shares_and_cost_basis():
+    equity={'symbol':'AAPL','asset_type':'equity','issuer':'Apple','sector':'Technology','market':'US',
+        'currency':'USD','is_etf':False,'underlying':None,'expiration':None,'strike':None,
+        'right':None,'multiplier':1,'adjusted':False,'occ_verified':True}
+    init={'kind':'portfolio_initialized','cash_gbp':'100000','nav_gbp':'100000','peak_nav_gbp':'100000'}
+    cases=[
+        [init,{'kind':'valuation','nav_gbp':'99999','peak_nav_gbp':'100000'}],
+        [init,{'kind':'position','instrument':equity,'quantity_delta':-1,'cost_basis_delta_gbp':'0'}],
+        [init,{'kind':'position','instrument':equity,'quantity_delta':1,'cost_basis_delta_gbp':'-1'}]]
+    for rows in cases:
+        with pytest.raises(ValueError): portfolio_collect({'records':seal_history(rows)})
+
+
+def test_ledger_replay_rejects_duplicate_pending_and_altered_history():
+    submission={'instrument':proposal()['operation']['instrument'],'side':'sell','intent':'open','quantity':1,
+        'reserved_cash_gbp':'0','reserved_collateral_gbp':'2000','covered_shares':0,'submission_artifact_id':'submission-1'}
+    history=seal_history([{'kind':'portfolio_initialized','cash_gbp':'100000','nav_gbp':'100000','peak_nav_gbp':'100000'}, {'kind':'pending_submission','submission':submission}, {'kind':'pending_submission','submission':submission}])
+    with pytest.raises(ValueError,match='duplicate pending'):
+        portfolio_collect({'records':history})
+    altered=dict(history[1]); altered['submission']={**submission,'quantity':2}
+    with pytest.raises(ValueError,match='altered'):
+        portfolio_collect({'records':[history[0],altered]})
+    with pytest.raises(ValueError,match='reordered'):
+        portfolio_collect({'records':[history[0],history[2],history[1]]})

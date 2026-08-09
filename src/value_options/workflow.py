@@ -115,7 +115,8 @@ def portfolio_from_artifact(supplied, trusted_attestor=None):
 
 def _portfolio_payload(p):
     required={'nav_gbp','peak_nav_gbp','cash_gbp','positions','pending_submissions',
-              'drawdown','source_ledger_record_ids','initialization_mode'}
+              'drawdown','source_ledger_record_ids','source_ledger_records',
+              'ledger_ancestry_sha256','initialization_mode'}
     if set(p)!=required: raise ValueError('portfolio snapshot schema mismatch')
     positions={}; marks={}
     for row in p['positions']:
@@ -124,7 +125,9 @@ def _portfolio_payload(p):
         if instrument in positions: raise ValueError('duplicate portfolio instrument')
         quantity=int(row['quantity']); mark=Decimal(row['mark_gbp'])
         if quantity==0 or mark<0 or not mark.is_finite(): raise ValueError('invalid portfolio quantity or mark')
-        positions[instrument]=Position(instrument,quantity,Decimal(row['cost_basis_gbp'])); marks[instrument]=mark
+        cost=Decimal(row['cost_basis_gbp'])
+        if not cost.is_finite() or cost<0: raise ValueError('invalid position cost basis')
+        positions[instrument]=Position(instrument,quantity,cost); marks[instrument]=mark
     pending_cash=Decimal('0'); pending_collateral=Decimal('0'); pending_covered={}
     for pending in p['pending_submissions']:
         if set(pending)!={'instrument','side','intent','quantity','reserved_cash_gbp','reserved_collateral_gbp','covered_shares','submission_artifact_id'}:
@@ -142,42 +145,93 @@ def _portfolio_payload(p):
     refs=p['source_ledger_record_ids']
     if not isinstance(refs,list) or len(refs)!=len(set(refs)) or any(not isinstance(x,str) or not x for x in refs): raise ValueError('invalid source ledger references')
     if not isinstance(p['initialization_mode'],bool): raise ValueError('invalid initialization mode')
+    if not isinstance(p['source_ledger_records'],list) or [x.get('record_id') for x in p['source_ledger_records']]!=refs: raise ValueError('ledger ancestry order mismatch')
+    if p['ledger_ancestry_sha256']!=hashlib.sha256(canonical_json(p['source_ledger_records'])).hexdigest(): raise ValueError('ledger ancestry hash mismatch')
     return PortfolioRisk(nav,peak,cash,positions,marks,pending_cash,pending_collateral,pending_covered)
+
+def seal_ledger_record(value, *, sequence=0, previous_record_id=""):
+    """Create immutable identity for fixture/import preparation, never mutate one."""
+    body=dict(value); body.pop('record_id',None); body.pop('seal',None)
+    body['sequence']=sequence; body['previous_record_id']=previous_record_id
+    record_id=hashlib.sha256(canonical_json(body)).hexdigest()
+    return {'record_id':record_id,**body,'seal':hashlib.sha256(canonical_json({'record_id':record_id,**body})).hexdigest()}
+
+def _verify_ledger_record(record):
+    if not isinstance(record,dict) or not record.get('record_id') or not record.get('seal'): return False
+    body={k:v for k,v in record.items() if k not in {'record_id','seal'}}
+    expected=seal_ledger_record(body,sequence=body.pop('sequence',None),previous_record_id=body.pop('previous_record_id',None))
+    return record==expected
 
 def portfolio_collect(source, *, initialize=False, expected_state=None):
     """Replay append-only paper-ledger records into a reconciled snapshot."""
     if not isinstance(source,dict) or set(source)!={'records'} or not isinstance(source['records'],list): raise ValueError('paper ledger input schema mismatch')
-    records=source['records']; ids=[]; cash=Decimal('0'); nav=peak=Decimal('0'); positions={}; marks={}; pending={}; initialized=False
-    for record in records:
-        if not isinstance(record,dict) or not record.get('record_id') or record['record_id'] in ids: raise ValueError('invalid or duplicate ledger record')
+    records=source['records']; ids=[]; cash=Decimal('0'); peak=Decimal('0'); positions={}; marks={}; pending={}; initialized=False
+    def marked_nav():
+        value=cash-sum((Decimal(x['reserved_cash_gbp']) for x in pending.values()),Decimal('0'))
+        for instrument,row in positions.items(): value+=Decimal(row['quantity'])*instrument.multiplier*marks.get(instrument,Decimal('0'))
+        return value
+    previous=""
+    for expected_sequence,record in enumerate(records):
+        if not _verify_ledger_record(record) or record['record_id'] in ids: raise ValueError('unverified, altered or duplicate ledger record')
+        if record.get('sequence')!=expected_sequence or record.get('previous_record_id')!=previous: raise ValueError('ledger record ancestry reordered or missing')
         ids.append(record['record_id']); kind=record.get('kind')
+        previous=record['record_id']
         if kind=='portfolio_initialized':
             if initialized or record.get('cash_gbp')!='100000' or record.get('nav_gbp')!='100000' or record.get('peak_nav_gbp')!='100000': raise ValueError('invalid portfolio initialization record')
-            cash=nav=peak=Decimal('100000'); initialized=True
+            cash=peak=Decimal('100000'); initialized=True
         elif not initialized: raise ValueError('ledger history lacks initialization')
-        elif kind=='cash': cash+=Decimal(record['amount_gbp'])
+        elif kind=='cash':
+            cash+=Decimal(record['amount_gbp'])
+            if not cash.is_finite() or cash<0: raise ValueError('paper ledger cash cannot be negative or non-finite')
         elif kind=='position':
             instrument=_instrument(record['instrument']); row=positions.setdefault(instrument,{'instrument':record['instrument'],'quantity':0,'cost_basis_gbp':'0','mark_gbp':'0'})
-            row['quantity']+=int(record['quantity_delta']); row['cost_basis_gbp']=str(Decimal(row['cost_basis_gbp'])+Decimal(record.get('cost_basis_delta_gbp','0')))
+            before=row['quantity']; after=before+int(record['quantity_delta']); cost=Decimal(row['cost_basis_gbp'])+Decimal(record.get('cost_basis_delta_gbp','0'))
+            if before and after and before*after<0: raise ValueError('impossible position transition through zero')
+            if instrument.asset_type is AssetType.EQUITY and after<0: raise ValueError('negative share quantity prohibited')
+            if not cost.is_finite() or cost<0: raise ValueError('invalid position cost basis')
+            row['quantity']=after; row['cost_basis_gbp']=str(cost)
             if not row['quantity']: positions.pop(instrument)
         elif kind=='mark':
-            instrument=_instrument(record['instrument']); marks[instrument]=Decimal(record['mark_gbp'])
-        elif kind=='pending_submission': pending[record['submission']['submission_artifact_id']]=record['submission']
+            instrument=_instrument(record['instrument']); mark=Decimal(record['mark_gbp'])
+            if not mark.is_finite() or mark<0: raise ValueError('invalid ledger mark')
+            marks[instrument]=mark
+        elif kind=='pending_submission':
+            key=record['submission']['submission_artifact_id']
+            if key in pending: raise ValueError('duplicate pending submission ID')
+            pending[key]=record['submission']
         elif kind=='submission_resolved':
             if record['submission_artifact_id'] not in pending: raise ValueError('unknown pending submission resolution')
             pending.pop(record['submission_artifact_id'])
-        elif kind=='valuation': nav=Decimal(record['nav_gbp']); peak=max(peak,Decimal(record['peak_nav_gbp']))
+        elif kind=='valuation':
+            computed=marked_nav(); stated=Decimal(record['nav_gbp']); stated_peak=Decimal(record['peak_nav_gbp'])
+            if stated!=computed: raise ValueError('valuation NAV disagrees with reconstructed state')
+            peak=max(peak,computed)
+            if stated_peak!=peak: raise ValueError('valuation peak NAV disagrees with reconstructed state')
         else: raise ValueError('unknown paper ledger record kind')
     if not records:
         if not initialize: raise ValueError('empty ledger requires explicit initialization mode')
-        ids=['bootstrap:gbp100000']; cash=nav=peak=Decimal('100000'); initialized=True
+        bootstrap=seal_ledger_record({'kind':'portfolio_initialized','cash_gbp':'100000','nav_gbp':'100000','peak_nav_gbp':'100000'},sequence=0,previous_record_id='')
+        records=[bootstrap]; ids=[bootstrap['record_id']]; cash=peak=Decimal('100000'); initialized=True
     elif initialize: raise ValueError('initialization mode is one-time and requires an empty ledger')
     for instrument,row in positions.items():
         if instrument not in marks: raise ValueError('position is missing a ledger mark')
         row['mark_gbp']=str(marks[instrument])
+    # Validate final option shorts against actual secured cash/share cover.
+    put_collateral=Decimal('0')
+    for instrument,row in positions.items():
+        if row['quantity']<0 and instrument.asset_type is AssetType.OPTION:
+            if instrument.right is OptionRight.PUT: put_collateral+=abs(row['quantity'])*instrument.multiplier*instrument.strike
+            elif instrument.right is OptionRight.CALL:
+                shares=sum(x['quantity'] for i,x in positions.items() if i.asset_type is AssetType.EQUITY and i.symbol==instrument.underlying)
+                if shares<abs(row['quantity'])*instrument.multiplier: raise ValueError('uncovered short call in ledger')
+            else: raise ValueError('invalid short option position')
+    if put_collateral>cash: raise ValueError('unsecured short put in ledger')
+    nav=marked_nav(); peak=max(peak,nav)
+    initialization_mode=not source['records']
     payload={'nav_gbp':str(nav),'peak_nav_gbp':str(peak),'cash_gbp':str(cash),'positions':list(positions.values()),
         'pending_submissions':list(pending.values()),'drawdown':str(max(Decimal('0'),(peak-nav)/peak)),
-        'source_ledger_record_ids':ids,'initialization_mode':not records}
+        'source_ledger_record_ids':ids,'source_ledger_records':records,
+        'ledger_ancestry_sha256':hashlib.sha256(canonical_json(records)).hexdigest(),'initialization_mode':initialization_mode}
     _portfolio_payload(payload)
     if expected_state is not None and canonical_json(expected_state)!=canonical_json(payload): raise ValueError('supplied state disagrees with reconstructed ledger state')
     return seal_artifact('portfolio_snapshot',payload)
