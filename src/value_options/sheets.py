@@ -228,9 +228,14 @@ class ProductionSheetAttestorPolicy:
     def trusts(self, receipt: AttestationReceipt) -> bool:
         if receipt.provenance!="authenticated-production" or receipt.external_system!=self.external_system:
             return False
+        if not re.fullmatch(r"(?:'Attestations'|Attestations)!A([2-9][0-9]*):G\1",receipt.immutable_location):
+            return False
         try: record=SheetRecord.from_row(self.adapter.read_row(receipt.immutable_location))
         except (ValueError,ExternalServiceError): return False
-        return record.verify() and record.artifact_id==receipt.artifact_id and record.content_sha256==receipt.content_sha256
+        return (record.verify() and record.appended_at==receipt.appended_at
+                and receipt.read_back_at>=receipt.appended_at
+                and record.artifact_id==receipt.artifact_id
+                and record.content_sha256==receipt.content_sha256)
 
 
 def production_trusted_attestor_factory(environ: Mapping[str, str] | None = None, *, transport=None):

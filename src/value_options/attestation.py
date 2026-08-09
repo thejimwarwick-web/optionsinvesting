@@ -102,7 +102,8 @@ class AttestedArtifact:
                 "parent_artifact_ids": list(self.parent_artifact_ids)}
 
     def as_json(self) -> dict[str, Any]:
-        return {"envelope_id": self.envelope_id, **self.body(), "seal": self.seal}
+        return {"envelope_id": self.envelope_id, **self.body(),
+                "parents": [parent.as_json() for parent in self.parents], "seal": self.seal}
 
 
 def load_attested_artifact(value: Mapping[str, Any]) -> AttestedArtifact:
@@ -111,10 +112,11 @@ def load_attested_artifact(value: Mapping[str, Any]) -> AttestedArtifact:
     receipt=AttestationReceipt(r["artifact_id"],r["external_system"],datetime.fromisoformat(r["appended_at"]),
         r["immutable_location"],datetime.fromisoformat(r["read_back_at"]),r["content_sha256"],
         r["provenance"],r["receipt_id"],r["seal"])
+    parents=tuple(load_attested_artifact(parent) for parent in value.get("parents",()))
     return AttestedArtifact(canonical_json(value["original_artifact"]),value["local_artifact_id"],
         value["local_artifact_seal"],receipt,canonical_json(value["exact_read_back"]),
         value["external_system"],value["immutable_location"],tuple(value.get("parent_artifact_ids",())),
-        (),value["envelope_id"],value["seal"])
+        parents,value["envelope_id"],value["seal"])
 
 
 @dataclass(frozen=True)

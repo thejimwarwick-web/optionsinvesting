@@ -11,8 +11,8 @@ from .workflow import ReadResult
 
 AUX_ENV={'corporate_action':'VALUE_OPTIONS_ENABLE_CORPORATE_ACTION_READS','dividend':'VALUE_OPTIONS_ENABLE_DIVIDEND_READS','fx':'VALUE_OPTIONS_ENABLE_GBPUSD_READS'}
 AUX_SENTINEL='I_UNDERSTAND_AUXILIARY_READ_ONLY_ACCESS'
-AUX_ENDPOINTS={'corporate_action':('paper-api.alpaca.markets','/v2/corporate_actions/announcements'),
-               'dividend':('paper-api.alpaca.markets','/v2/corporate_actions/announcements'),
+AUX_ENDPOINTS={'corporate_action':('data.alpaca.markets','/v1/corporate-actions'),
+               'dividend':('data.alpaca.markets','/v1/corporate-actions'),
                'fx':('data.alpaca.markets','/v1beta1/forex/latest/quotes')}
 PROVIDER_POLICY_VERSION='read-only-v1'
 
@@ -27,10 +27,12 @@ class ProductionCollectionProviders:
             if len(raw)!=1: raise ExternalServiceError('calendar response must cover exactly one session')
             row=raw[0]; n={'session_date':row['date'],'open':row.get('open'),'close':row.get('close')}
         elif kind=='underlying_quote':
-            q=raw['quote']; n={'timestamp':q['t'],'symbol':q.get('S') or q.get('symbol'),'bid':q['bp'],'ask':q['ap'],'bid_size':q['bs'],'ask_size':q['as']}
+            q=raw['quote']; n={'timestamp':q['t'],'symbol':raw.get('symbol'),'bid':q['bp'],'ask':q['ap'],'bid_size':q['bs'],'ask_size':q['as']}
         elif kind=='option_chain':
             contracts=[]; timestamps=[]
-            for symbol,snapshot in raw['snapshots'].items():
+            pages=raw.get('pages',[raw]); snapshots={}
+            for page in pages: snapshots.update(page['snapshots'])
+            for symbol,snapshot in snapshots.items():
                 details=snapshot.get('details') or {}; quote=snapshot.get('latestQuote') or {}
                 timestamps.append(quote.get('t'))
                 contracts.append({'symbol':symbol,'underlying':details.get('underlying_symbol'),
@@ -55,7 +57,7 @@ class ProductionCollectionProviders:
     def option_quote(self,symbol): return self._alpaca(self.alpaca.option_quote(symbol),'option_quote')
     def _aux(self,name,parameter):
         host,path=AUX_ENDPOINTS[name]
-        query=({'symbols':parameter,'ca_types':'cash_dividend' if name=='dividend' else 'all'}
+        query=({'symbols':parameter,'types':'cash_dividend' if name=='dividend' else 'all','limit':1000,'sort':'asc'}
                if name!='fx' else {'symbols':parameter})
         url=f'https://{host}{path}?{urlencode(query)}'
         response=self.transport.request('GET',url,headers={'Accept':'application/json',
@@ -70,9 +72,9 @@ class ProductionCollectionProviders:
             bid,ask=q.get('bp'),q.get('ap'); normalized={'symbol':'GBPUSD','timestamp':q.get('t'),
                 'bid':bid,'ask':ask,'mid':str((float(bid)+float(ask))/2)}
         else:
-            rows=raw.get('announcements') if isinstance(raw,Mapping) else raw
+            rows=raw.get('corporate_actions') if isinstance(raw,Mapping) else None
             if not isinstance(rows,list): raise ExternalServiceError(name+' evidence response malformed')
-            matched=[x for x in rows if isinstance(x,Mapping) and parameter in x.get('symbol',x.get('symbols',[]))]
+            matched=[x for x in rows if isinstance(x,Mapping) and x.get('symbol')==parameter]
             if not matched: raise ExternalServiceError(name+' evidence response mismatched request')
             latest=max(matched,key=lambda x:x.get('updated_at','')); normalized={'symbol':parameter,
                 'timestamp':latest.get('updated_at'),'retrieved_at':latest.get('updated_at'),

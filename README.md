@@ -237,10 +237,10 @@ value-options workflow-rehearsal evidence-bundle.json --state fund-state.json --
 value-options inspect tests/fixtures/alpaca_opra_quote.json --as-of 2026-08-07T13:40:03Z --output artifacts/inspection.json
 ```
 
-The collect commands enforce research → trusted, externally attested portfolio-snapshot envelope → decision → submission → fill ancestry. Portfolio snapshots reconstruct actual cash, NAV, peak NAV/drawdown, holdings, option shorts and marks, so existing CSP collateral, covered calls, and issuer/sector usage enter the authoritative risk calculation.
+The collect commands enforce externally attested research → trusted, externally attested portfolio-snapshot envelope → externally attested decision → externally attested submission → fill ancestry; local artifacts fail closed at prospective boundaries. Portfolio snapshots reconstruct actual cash, NAV, peak NAV/drawdown, holdings, option shorts and marks, so existing CSP collateral, covered calls, and issuer/sector usage enter the authoritative risk calculation.
 Research accepts only underlying/thesis pairs; prospective code obtains clock,
 calendar, and every underlying quote through injected read-only provider ports. Decision uses fresh complete evidence, OPRA contract data, and
-explicit corporate-action, dividend, and GBP/USD provider ports, and the
+explicit corporate-action, dividend, and GBP/USD provider ports, deterministic traversal of every option-chain page token, and the
 mandate/risk engine, then seals decision separately before simulated
 submission. Fill re-verifies all ancestors and fetches a new exact-contract OPRA quote itself,
 observed and received after submission; buys use ask and sells use bid.

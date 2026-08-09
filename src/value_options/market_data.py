@@ -121,7 +121,7 @@ def assess(packet: EvidencePacket, *, as_of: datetime, cutoff: datetime,
     # Calendars describe session coverage, not a point-in-time market observation.
     # Their provenance is bounded by requested_at/received_at instead.
     if timestamp is None and packet.kind is not EvidenceKind.CALENDAR: reasons.append("missing timestamp")
-    else:
+    elif timestamp is not None:
         if timestamp > as_of: reasons.append("future-dated")
         if timestamp > cutoff: reasons.append("observed post-cutoff")
         if max_age is not None and as_of - timestamp > max_age: reasons.append("stale")

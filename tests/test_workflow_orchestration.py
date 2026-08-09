@@ -52,22 +52,26 @@ class Trusted:
     def trusts(self,receipt): return receipt.provenance=='test-authenticated'
 TRUSTED=Trusted()
 
+def attest(artifact,parents=()):
+    receipt=AttestationReceipt.create(artifact_id=artifact['artifact_id'],external_system='fixture-trusted',appended_at=AT,immutable_location='A2:G2',read_back_at=AT,content_sha256=hashlib.sha256(canonical_json(artifact)).hexdigest(),provenance='test-authenticated')
+    return create_attested_artifact(artifact,receipt,artifact,parents=parents,trusted_attestor=TRUSTED)
+
 def portfolio_artifact():
     artifact=seal_artifact('portfolio_snapshot',{'nav_gbp':'100000','peak_nav_gbp':'100000','cash_gbp':'100000','positions':[],'pending_submissions':[]})
-    receipt=AttestationReceipt.create(artifact_id=artifact['artifact_id'],external_system='fixture-trusted',appended_at=AT,immutable_location='A2:G2',read_back_at=AT,content_sha256=hashlib.sha256(canonical_json(artifact)).hexdigest(),provenance='test-authenticated')
-    return create_attested_artifact(artifact,receipt,artifact,trusted_attestor=TRUSTED).as_json()
+    return attest(artifact).as_json()
 
 def collect_research(tmp_path,clock,providers):
     source=tmp_path/'candidates.json'; out=tmp_path/'research.json'; write(source,{'candidates':[{'underlying':'AAPL','thesis':'value'}]})
     assert main(['research-collect',str(source),'--output',str(out)],collection_providers=providers,utc_clock=clock,trusted_attestor=TRUSTED)==0
+    write(out,attest(json.loads(out.read_text())).as_json())
     return out
 
 def test_successful_research_collection_and_no_option_access(tmp_path):
     clock=TickClock(datetime(2026,8,7,12,30,tzinfo=UTC)); providers=Providers(clock)
     artifact=json.loads(collect_research(tmp_path,clock,providers).read_text())
-    assert artifact['artifact_kind']=='research'
+    assert artifact['original_artifact']['artifact_kind']=='research'
     assert providers.calls==['clock','calendar','underlying_quote']
-    assert len(artifact['payload']['evidence_packets'])==3
+    assert len(artifact['original_artifact']['payload']['evidence_packets'])==3
 
 def test_missing_research_evidence_quarantines(tmp_path):
     clock=TickClock(datetime(2026,8,7,12,30,tzinfo=UTC)); providers=Providers(clock,{'calendar'})
@@ -86,6 +90,9 @@ def test_prospective_decision_submission_and_fresh_fill(tmp_path):
     assert main(['decision-collect',str(research),str(portfolio),str(prop),'--decision-output',str(decision),'--submission-output',str(submission)],collection_providers=providers,utc_clock=clock,trusted_attestor=TRUSTED)==0
     assert {'corporate_action','dividend','fx'} <= set(providers.calls)
     sub=json.loads(submission.read_text()); assert sub['payload']['submitted_at']>sub['payload']['decision_at']
+    research_env=__import__('value_options.attestation',fromlist=['load_attested_artifact']).load_attested_artifact(json.loads(research.read_text()))
+    decision_env=attest(json.loads(decision.read_text()),(research_env,)); write(decision,decision_env.as_json())
+    submission_env=attest(json.loads(submission.read_text()),(decision_env,)); write(submission,submission_env.as_json())
     fill=tmp_path/'fill.json'
     assert main(['fill-collect',str(research),str(portfolio),str(decision),str(submission),'--output',str(fill)],collection_providers=providers,utc_clock=clock,trusted_attestor=TRUSTED)==0
     result=json.loads(fill.read_text())['payload']; assert result['price']=='1' and result['response_received_at']>sub['payload']['submitted_at']
@@ -163,3 +170,14 @@ def test_real_alpaca_wire_normalization_has_no_provider_normalized_field():
     assert normalize(response('alpaca_stock_quote_real.json','underlying_quote'),'underlying_quote').normalized['symbol']=='AAPL'
     assert normalize(response('alpaca_option_quote_real.json','option_quote','opra'),'option_quote').normalized['strike']=='20'
     assert normalize(response('alpaca_option_chain_real.json','option_chain','opra'),'option_chain').normalized['contracts'][0]['symbol']==CONTRACT
+
+
+def test_production_calendar_is_timestamp_free_and_assesses_session_coverage():
+    from value_options.market_data import assess, ingest_response
+    raw=json.loads((Path(__file__).parent/'fixtures'/'alpaca_calendar_real.json').read_text())
+    normalized={'session_date':'2026-08-07','open':'09:30','close':'16:00'}
+    packet=ingest_response(kind=EvidenceKind.CALENDAR,provider='alpaca',feed='alpaca-trading',
+        request={'start':'2026-08-07','end':'2026-08-07'},requested_at=AT,
+        received_at=AT+timedelta(seconds=1),raw=raw,normalized=normalized)
+    checked=assess(packet,as_of=AT+timedelta(seconds=2),cutoff=AT+timedelta(seconds=2),max_age=None)
+    assert checked.actionable and 'timestamp' not in packet.normalized

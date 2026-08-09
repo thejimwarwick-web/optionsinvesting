@@ -72,6 +72,14 @@ def collect_packet(kind,call,clock,request):
 
 def _run(portfolio=None): return PaperRun(DEFAULT_MANDATE,portfolio or PortfolioRisk(Decimal('100000'),Decimal('100000'),Decimal('100000'),{},{}))
 def _time(x): return datetime.fromisoformat(x).astimezone(timezone.utc)
+def _attested_local(value,kind,trusted_attestor):
+    from .attestation import AttestedArtifact, load_attested_artifact, verify_attested_artifact
+    envelope=value if isinstance(value,AttestedArtifact) else load_attested_artifact(value)
+    checked=verify_attested_artifact(envelope,trusted_attestor=trusted_attestor)
+    if not checked.verified or not checked.launch_eligible or envelope.original_artifact.get('artifact_kind')!=kind:
+        raise ValueError(f'trusted externally attested {kind} required')
+    return envelope,envelope.original_artifact
+
 def _research(value):
     ok,reasons=verify_artifact(value,'research')
     if not ok: raise ValueError('; '.join(reasons))
@@ -108,16 +116,19 @@ def portfolio_from_artifact(supplied, trusted_attestor=None):
         quantity=int(row['quantity']); mark=Decimal(row['mark_gbp'])
         if quantity==0 or mark<0 or not mark.is_finite(): raise ValueError('invalid portfolio quantity or mark')
         positions[instrument]=Position(instrument,quantity,Decimal(row['cost_basis_gbp'])); marks[instrument]=mark
+    pending_cash=Decimal('0'); pending_collateral=Decimal('0'); pending_covered={}
     for pending in p['pending_submissions']:
-        if set(pending)!={'instrument','quantity','mark_gbp','submission_artifact_id'}:
+        if set(pending)!={'instrument','side','intent','quantity','reserved_cash_gbp','reserved_collateral_gbp','covered_shares','submission_artifact_id'}:
             raise ValueError('pending submission schema mismatch')
-        instrument=_instrument(pending['instrument']); quantity=-abs(int(pending['quantity']))
-        if not pending['submission_artifact_id'] or not quantity: raise ValueError('invalid pending submission')
-        positions.setdefault(instrument,Position(instrument)).quantity+=quantity
-        marks.setdefault(instrument,Decimal(pending.get('mark_gbp','0')))
+        instrument=_instrument(pending['instrument']); quantity=int(pending['quantity'])
+        if pending['side'] not in {'buy','sell'} or pending['intent'] not in {'open','close','assign'} or not pending['submission_artifact_id'] or quantity<=0: raise ValueError('invalid pending submission')
+        reserved_cash=Decimal(pending['reserved_cash_gbp']); reserved_collateral=Decimal(pending['reserved_collateral_gbp']); covered=int(pending['covered_shares'])
+        if min(reserved_cash,reserved_collateral,Decimal(covered))<0: raise ValueError('invalid pending reservation')
+        pending_cash+=reserved_cash; pending_collateral+=reserved_collateral
+        if covered: pending_covered[instrument.underlying]=pending_covered.get(instrument.underlying,0)+covered
     nav,peak,cash=Decimal(p['nav_gbp']),Decimal(p['peak_nav_gbp']),Decimal(p['cash_gbp'])
     if any(not x.is_finite() or x<0 for x in (nav,peak,cash)) or nav==0 or peak<nav: raise ValueError('invalid portfolio cash or NAV')
-    return PortfolioRisk(nav,peak,cash,positions,marks)
+    return PortfolioRisk(nav,peak,cash,positions,marks,pending_cash,pending_collateral,pending_covered)
 def _evidence_refs(packets): return [{'name':p.kind.value,'value':p.packet_id,'available_at':p.received_at.isoformat(),'request_started_at':p.requested_at.isoformat(),'provider_observed_at':p.normalized.get('timestamp')} for p in packets]
 
 def research_collect(source,providers,clock):
@@ -137,7 +148,8 @@ def research_collect(source,providers,clock):
     return seal_artifact('research',payload)
 
 def decision_collect(research_artifact,portfolio_artifact,proposal,providers,clock,trusted_attestor=None):
-    research=_research(research_artifact); op=proposal['operation']; instrument=_instrument(op['instrument'])
+    research_envelope,research_local=_attested_local(research_artifact,'research',trusted_attestor)
+    research=_research(research_local); op=proposal['operation']; instrument=_instrument(op['instrument'])
     portfolio=portfolio_from_artifact(portfolio_artifact,trusted_attestor)
     portfolio_local=portfolio_artifact.original_artifact if hasattr(portfolio_artifact,'original_artifact') else portfolio_artifact['original_artifact']
     if instrument.underlying not in {x.underlying for x in research.shortlist}: raise ValueError('underlying absent from research shortlist')
@@ -154,25 +166,26 @@ def decision_collect(research_artifact,portfolio_artifact,proposal,providers,clo
     order=_order(op,instrument)
     decision=run.decide(decision_at,order,packets)
     rules=asdict(run.rule_results); rules['evaluated_at']=run.rule_results.evaluated_at.isoformat()
-    dp={'decision_id':decision.decision_id,'research_id':research.packet_id,'research_artifact_id':research_artifact['artifact_id'],'portfolio_snapshot_artifact_id':portfolio_local['artifact_id'],'decision_at':decision_at.isoformat(),'order':op,'record_seal':decision.seal,'rule_results':rules,'evidence_references':_evidence_refs(packets),'evidence_packet_ids':[p.packet_id for p in packets]}
+    dp={'decision_id':decision.decision_id,'research_id':research.packet_id,'research_artifact_id':research_local['artifact_id'],'portfolio_snapshot_artifact_id':portfolio_local['artifact_id'],'decision_at':decision_at.isoformat(),'order':op,'record_seal':decision.seal,'rule_results':rules,'evidence_references':_evidence_refs(packets),'evidence_packet_ids':[p.packet_id for p in packets]}
     da=seal_artifact('decision',dp); submitted_at=_now(clock); submission=run.submit(submitted_at)
     ledger_event={'event_id':'submission:'+decision.decision_id,'kind':'paper_submission','occurred_at':submission.submitted_at.isoformat(),'applied':False,'requires_launch_authorization':True}
     sp={'decision_artifact_id':da['artifact_id'],'decision_id':decision.decision_id,'decision_at':decision_at.isoformat(),'submitted_at':submission.submitted_at.isoformat(),'order':op,'rule_results_seal':rules['seal'],'evidence_packet_ids':[p.packet_id for p in packets],'paper_ledger_event':ledger_event}
     return da,seal_artifact('submission',sp)
 
 def fill_collect(research_artifact,portfolio_artifact,decision_artifact,submission_artifact,providers,clock,trusted_attestor=None):
-    research=_research(research_artifact); dok,dr=verify_artifact(decision_artifact,'decision'); sok,sr=verify_artifact(submission_artifact,'submission')
-    if not dok or not sok: raise ValueError('; '.join(dr+sr))
-    d,s=decision_artifact['payload'],submission_artifact['payload']
-    if d.get('research_artifact_id')!=research_artifact['artifact_id'] or d.get('research_id')!=research.packet_id: raise ValueError('research ancestry substitution')
+    research_envelope,research_local=_attested_local(research_artifact,'research',trusted_attestor)
+    decision_envelope,decision_local=_attested_local(decision_artifact,'decision',trusted_attestor)
+    submission_envelope,submission_local=_attested_local(submission_artifact,'submission',trusted_attestor)
+    research=_research(research_local); d,s=decision_local['payload'],submission_local['payload']
+    if d.get('research_artifact_id')!=research_local['artifact_id'] or d.get('research_id')!=research.packet_id: raise ValueError('research ancestry substitution')
     portfolio=portfolio_from_artifact(portfolio_artifact,trusted_attestor)
     portfolio_local=portfolio_artifact.original_artifact if hasattr(portfolio_artifact,'original_artifact') else portfolio_artifact['original_artifact']
     if d.get('portfolio_snapshot_artifact_id')!=portfolio_local['artifact_id']: raise ValueError('portfolio ancestry substitution')
-    if s.get('decision_artifact_id')!=decision_artifact['artifact_id'] or s.get('decision_id')!=d.get('decision_id'): raise ValueError('decision ancestry substitution')
+    if s.get('decision_artifact_id')!=decision_local['artifact_id'] or s.get('decision_id')!=d.get('decision_id'): raise ValueError('decision ancestry substitution')
     if canonical_json(s.get('order'))!=canonical_json(d.get('order')): raise ValueError('submission order differs from decision')
     if s.get('decision_at')!=d.get('decision_at') or _time(s['submitted_at'])<=_time(d['decision_at']): raise ValueError('decision/submission chronology invalid')
     if s.get('rule_results_seal')!=d.get('rule_results',{}).get('seal'): raise ValueError('rule-results ancestry substitution')
     op=s['order']; instrument=_instrument(op['instrument']); packet=collect_packet(EvidenceKind.OPTION_QUOTE,lambda:providers.option_quote(instrument.symbol),clock,{'symbol':instrument.symbol})
     run=_run(portfolio); order=_order(op,instrument); run.orders.append(OrderSubmission(s['decision_id'],_time(s['decision_at']),order,_time(s['submitted_at'])))
-    filled_at=_now(clock); fill=run.simulate_fill(packet,as_of=filled_at); fill.update(submission_artifact_id=submission_artifact['artifact_id'],research_artifact_id=research_artifact['artifact_id'],portfolio_snapshot_artifact_id=portfolio_local['artifact_id'],request_started_at=packet.requested_at.isoformat(),provider_observed_at=packet.normalized['timestamp'],response_received_at=packet.received_at.isoformat(),paper_ledger_event={'event_id':'fill:'+s['decision_id']+':'+packet.packet_id,'kind':'paper_fill','occurred_at':filled_at.isoformat(),'applied':False,'requires_launch_authorization':True})
+    filled_at=_now(clock); fill=run.simulate_fill(packet,as_of=filled_at); fill.update(submission_artifact_id=submission_local['artifact_id'],research_artifact_id=research_local['artifact_id'],portfolio_snapshot_artifact_id=portfolio_local['artifact_id'],request_started_at=packet.requested_at.isoformat(),provider_observed_at=packet.normalized['timestamp'],response_received_at=packet.received_at.isoformat(),paper_ledger_event={'event_id':'fill:'+s['decision_id']+':'+packet.packet_id,'kind':'paper_fill','occurred_at':filled_at.isoformat(),'applied':False,'requires_launch_authorization':True})
     return seal_artifact('fill',fill)

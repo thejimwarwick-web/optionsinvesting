@@ -20,6 +20,9 @@ class PortfolioRisk:
     cash_gbp: Decimal
     positions: dict[Instrument, Position]
     marks_gbp: dict[Instrument, Decimal]
+    pending_reserved_cash_gbp: Decimal = Decimal("0")
+    pending_csp_collateral_gbp: Decimal = Decimal("0")
+    pending_covered_shares: dict[str, int] | None = None
 
     @property
     def drawdown(self) -> Decimal:
@@ -67,12 +70,12 @@ class RiskEngine:
         if i.asset_type is AssetType.OPTION and order.side is Side.SELL and order.intent == "open":
             if i.right is OptionRight.PUT:
                 secured = i.strike * i.multiplier * order.quantity * fx_to_gbp
-                existing = self._csp_collateral(portfolio, fx_to_gbp)
+                existing = self._csp_collateral(portfolio, fx_to_gbp) + portfolio.pending_csp_collateral_gbp
                 if existing + secured > portfolio.nav_gbp * controls.csp_limit:
                     raise RiskViolation("cash-secured-put collateral limit exceeded")
             elif i.right is OptionRight.CALL:
                 shares = self._underlying_shares(i, portfolio)
-                already_covered = self._covered_call_shares(i, portfolio)
+                already_covered = self._covered_call_shares(i, portfolio) + (portfolio.pending_covered_shares or {}).get(i.underlying,0)
                 maximum = shares if order.exit_entire_holding else int(shares * self.mandate.covered_call_fraction)
                 if already_covered + order.quantity * i.multiplier > maximum:
                     raise RiskViolation("uncovered call or covered-call fraction exceeded")
@@ -99,7 +102,7 @@ class RiskEngine:
         if potential > portfolio.nav_gbp * self.mandate.maximum_potential_exposure:
             raise RiskViolation("maximum potential exposure exceeded")
         purchase_cash = trade_exposure if order.side is Side.BUY and order.intent == "open" else Decimal("0")
-        if portfolio.cash_gbp - secured - purchase_cash < portfolio.nav_gbp * self.mandate.minimum_free_cash:
+        if portfolio.cash_gbp - portfolio.pending_reserved_cash_gbp - secured - purchase_cash < portfolio.nav_gbp * self.mandate.minimum_free_cash:
             raise RiskViolation("minimum free cash would be breached")
 
     @staticmethod
