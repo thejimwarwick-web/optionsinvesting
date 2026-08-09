@@ -101,6 +101,21 @@ class AttestedArtifact:
                 "immutable_location": self.immutable_location,
                 "parent_artifact_ids": list(self.parent_artifact_ids)}
 
+    def as_json(self) -> dict[str, Any]:
+        return {"envelope_id": self.envelope_id, **self.body(), "seal": self.seal}
+
+
+def load_attested_artifact(value: Mapping[str, Any]) -> AttestedArtifact:
+    """Load a supplied parentless envelope verbatim; verification is separate."""
+    r=value["receipt"]
+    receipt=AttestationReceipt(r["artifact_id"],r["external_system"],datetime.fromisoformat(r["appended_at"]),
+        r["immutable_location"],datetime.fromisoformat(r["read_back_at"]),r["content_sha256"],
+        r["provenance"],r["receipt_id"],r["seal"])
+    return AttestedArtifact(canonical_json(value["original_artifact"]),value["local_artifact_id"],
+        value["local_artifact_seal"],receipt,canonical_json(value["exact_read_back"]),
+        value["external_system"],value["immutable_location"],tuple(value.get("parent_artifact_ids",())),
+        (),value["envelope_id"],value["seal"])
+
 
 @dataclass(frozen=True)
 class AttestationVerification:
@@ -117,7 +132,7 @@ def _expected_parents(artifact: Mapping[str, Any], parents: Sequence[AttestedArt
     kind, payload = artifact.get("artifact_kind"), artifact.get("payload", {})
     if any(not isinstance(parent, AttestedArtifact) for parent in parents):
         raise ValueError("parents must be verified attested-artifact envelopes")
-    if kind in {"research", "evidence"}:
+    if kind in {"research", "evidence", "portfolio_snapshot"}:
         if parents: raise ValueError(f"{kind} cannot have parents")
         return ()
     if kind == "decision":

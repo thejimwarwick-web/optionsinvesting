@@ -5,13 +5,14 @@ import pytest
 
 from value_options.cli import main
 from value_options.operations import seal_artifact
+from value_options.attestation import AttestationReceipt, create_attested_artifact
 from value_options.market_data import EvidenceKind, canonical_json
 import hashlib
 from value_options.sheets import GoogleSheetsAdapter, HEADERS, SheetAttestationBoundary
 from value_options.workflow import ReadResult
 from value_options.workflow import AtomicCheckpoint, collect_packet
 
-UTC=timezone.utc; CONTRACT='AAPL260828P00020000'
+UTC=timezone.utc; CONTRACT='AAPL260828P00020000'; AT=datetime(2026,8,7,12,30,tzinfo=UTC)
 
 class TickClock:
     def __init__(self,at): self.value=at
@@ -47,14 +48,18 @@ def write(path,value): path.write_text(json.dumps(value))
 def proposal(): return {'operation':{'order_id':'paper-1','side':'sell','quantity':1,'intent':'open','exit_entire_holding':False,'sale_floor':None,'instrument':{'symbol':CONTRACT,'asset_type':'option','issuer':'Apple','sector':'Technology','market':'US','currency':'USD','is_etf':False,'underlying':'AAPL','expiration':'2026-08-28','strike':'20','right':'put','multiplier':100,'adjusted':False,'occ_verified':True}}}
 
 
+class Trusted:
+    def trusts(self,receipt): return receipt.provenance=='test-authenticated'
+TRUSTED=Trusted()
+
 def portfolio_artifact():
-    payload={'nav_gbp':'100000','peak_nav_gbp':'100000','cash_gbp':'100000','positions':[],'externally_reconciled':True}
-    payload['reconciliation_seal']=hashlib.sha256(canonical_json(payload)).hexdigest()
-    return seal_artifact('portfolio_snapshot',payload)
+    artifact=seal_artifact('portfolio_snapshot',{'nav_gbp':'100000','peak_nav_gbp':'100000','cash_gbp':'100000','positions':[],'pending_submissions':[]})
+    receipt=AttestationReceipt.create(artifact_id=artifact['artifact_id'],external_system='fixture-trusted',appended_at=AT,immutable_location='A2:G2',read_back_at=AT,content_sha256=hashlib.sha256(canonical_json(artifact)).hexdigest(),provenance='test-authenticated')
+    return create_attested_artifact(artifact,receipt,artifact,trusted_attestor=TRUSTED).as_json()
 
 def collect_research(tmp_path,clock,providers):
     source=tmp_path/'candidates.json'; out=tmp_path/'research.json'; write(source,{'candidates':[{'underlying':'AAPL','thesis':'value'}]})
-    assert main(['research-collect',str(source),'--output',str(out)],collection_providers=providers,utc_clock=clock)==0
+    assert main(['research-collect',str(source),'--output',str(out)],collection_providers=providers,utc_clock=clock,trusted_attestor=TRUSTED)==0
     return out
 
 def test_successful_research_collection_and_no_option_access(tmp_path):
@@ -67,7 +72,7 @@ def test_successful_research_collection_and_no_option_access(tmp_path):
 def test_missing_research_evidence_quarantines(tmp_path):
     clock=TickClock(datetime(2026,8,7,12,30,tzinfo=UTC)); providers=Providers(clock,{'calendar'})
     source=tmp_path/'in.json'; out=tmp_path/'out.json'; write(source,{'candidates':[{'underlying':'AAPL','thesis':'x'}]})
-    assert main(['research-collect',str(source),'--output',str(out)],collection_providers=providers,utc_clock=clock)==1
+    assert main(['research-collect',str(source),'--output',str(out)],collection_providers=providers,utc_clock=clock,trusted_attestor=TRUSTED)==1
     assert json.loads(out.read_text())['quarantined']
 
 def test_collect_rejects_caller_timestamps(tmp_path):
@@ -78,27 +83,27 @@ def test_prospective_decision_submission_and_fresh_fill(tmp_path):
     rclock=TickClock(datetime(2026,8,7,12,30,tzinfo=UTC)); research=collect_research(tmp_path,rclock,Providers(rclock))
     clock=TickClock(datetime(2026,8,7,13,40,tzinfo=UTC)); providers=Providers(clock); prop=tmp_path/'proposal.json'; write(prop,proposal()); portfolio=tmp_path/'portfolio.json'; write(portfolio,portfolio_artifact())
     decision,submission=tmp_path/'decision.json',tmp_path/'submission.json'
-    assert main(['decision-collect',str(research),str(portfolio),str(prop),'--decision-output',str(decision),'--submission-output',str(submission)],collection_providers=providers,utc_clock=clock)==0
+    assert main(['decision-collect',str(research),str(portfolio),str(prop),'--decision-output',str(decision),'--submission-output',str(submission)],collection_providers=providers,utc_clock=clock,trusted_attestor=TRUSTED)==0
     assert {'corporate_action','dividend','fx'} <= set(providers.calls)
     sub=json.loads(submission.read_text()); assert sub['payload']['submitted_at']>sub['payload']['decision_at']
     fill=tmp_path/'fill.json'
-    assert main(['fill-collect',str(research),str(portfolio),str(decision),str(submission),'--output',str(fill)],collection_providers=providers,utc_clock=clock)==0
+    assert main(['fill-collect',str(research),str(portfolio),str(decision),str(submission),'--output',str(fill)],collection_providers=providers,utc_clock=clock,trusted_attestor=TRUSTED)==0
     result=json.loads(fill.read_text())['payload']; assert result['price']=='1' and result['response_received_at']>sub['payload']['submitted_at']
 
 @pytest.mark.parametrize('missing',[{'corporate_action'},{'dividend'},{'fx'}])
 def test_missing_auxiliary_provider_quarantines(tmp_path,missing):
     rc=TickClock(datetime(2026,8,7,12,30,tzinfo=UTC)); research=collect_research(tmp_path,rc,Providers(rc))
     clock=TickClock(datetime(2026,8,7,13,40,tzinfo=UTC)); prop=tmp_path/'p.json'; write(prop,proposal()); portfolio=tmp_path/'portfolio.json'; write(portfolio,portfolio_artifact()); d,s=tmp_path/'d',tmp_path/'s'
-    assert main(['decision-collect',str(research),str(portfolio),str(prop),'--decision-output',str(d),'--submission-output',str(s)],collection_providers=Providers(clock,missing),utc_clock=clock)==1
+    assert main(['decision-collect',str(research),str(portfolio),str(prop),'--decision-output',str(d),'--submission-output',str(s)],collection_providers=Providers(clock,missing),utc_clock=clock,trusted_attestor=TRUSTED)==1
 
 def test_stale_fill_and_ancestry_substitution_rejected(tmp_path):
     rc=TickClock(datetime(2026,8,7,12,30,tzinfo=UTC)); research=collect_research(tmp_path,rc,Providers(rc))
     clock=TickClock(datetime(2026,8,7,13,40,tzinfo=UTC)); p=tmp_path/'p'; write(p,proposal()); portfolio=tmp_path/'portfolio'; write(portfolio,portfolio_artifact()); d,s=tmp_path/'d',tmp_path/'s'
     main(['decision-collect',str(research),str(portfolio),str(p),'--decision-output',str(d),'--submission-output',str(s)],collection_providers=Providers(clock),utc_clock=clock)
     providers=Providers(clock); providers.stale=True; out=tmp_path/'fill'
-    assert main(['fill-collect',str(research),str(portfolio),str(d),str(s),'--output',str(out)],collection_providers=providers,utc_clock=clock)==1
+    assert main(['fill-collect',str(research),str(portfolio),str(d),str(s),'--output',str(out)],collection_providers=providers,utc_clock=clock,trusted_attestor=TRUSTED)==1
     forged=seal_artifact('research',{'research_id':'other'}); other=tmp_path/'other'; write(other,forged)
-    assert main(['fill-collect',str(other),str(portfolio),str(d),str(s),'--output',str(out)],collection_providers=Providers(clock),utc_clock=clock)==1
+    assert main(['fill-collect',str(other),str(portfolio),str(d),str(s),'--output',str(out)],collection_providers=Providers(clock),utc_clock=clock,trusted_attestor=TRUSTED)==1
 
 def test_sheet_recovery_after_external_write_without_duplicate():
     port=MemorySheet(); boundary=SheetAttestationBoundary(port); artifact=seal_artifact('research',{'research_id':'x'}); at=datetime(2026,8,7,12,30,tzinfo=UTC); env={'VALUE_OPTIONS_ENABLE_PAPER_LEDGER_APPEND':'I_AUTHORIZE_APPEND_ONLY_PAPER_LEDGER'}
@@ -113,7 +118,7 @@ def test_sheet_preflight_exact_and_rehearsal_nonempty_state(tmp_path):
     assert adapter.preflight('expected')['writes']==0
     state=portfolio_artifact()
     snapshot=tmp_path/'state.json'; bundle=tmp_path/'bundle.json'; out=tmp_path/'out.json'; write(snapshot,state); write(bundle,{'packets':[]})
-    assert main(['workflow-rehearsal',str(bundle),'--state',str(snapshot),'--as-of','2026-08-07T13:40:00Z','--output',str(out)])==0
+    assert main(['workflow-rehearsal',str(bundle),'--state',str(snapshot),'--as-of','2026-08-07T13:40:00Z','--output',str(out)],trusted_attestor=TRUSTED)==0
     assert json.loads(out.read_text())['persisted_state_unchanged']
 
 
@@ -122,9 +127,9 @@ def test_checkpoint_repeat_is_idempotent_and_subprocess_quarantines(tmp_path):
     source=tmp_path/'input.json'; output=tmp_path/'output.json'; checkpoint=tmp_path/'checkpoint.json'
     write(source,{'candidates':[{'underlying':'AAPL','thesis':'value'}]})
     command=['research-collect',str(source),'--output',str(output),'--checkpoint',str(checkpoint)]
-    assert main(command,collection_providers=providers,utc_clock=clock)==0
+    assert main(command,collection_providers=providers,utc_clock=clock,trusted_attestor=TRUSTED)==0
     calls=tuple(providers.calls)
-    assert main(command,collection_providers=providers,utc_clock=clock)==0
+    assert main(command,collection_providers=providers,utc_clock=clock,trusted_attestor=TRUSTED)==0
     assert tuple(providers.calls)==calls
     isolated=tmp_path/'isolated.json'
     result=subprocess.run([sys.executable,'-m','value_options.cli','research-collect',
@@ -141,3 +146,20 @@ def test_checkpoint_binding_tamper_and_observation_after_receipt_are_rejected(tm
     def future(): return ReadResult('fixture','fixture',{}, {'timestamp':(clock.value+timedelta(minutes=1)).isoformat()})
     with pytest.raises(ValueError,match='after response receipt'):
         collect_packet(EvidenceKind.CLOCK,future,clock,{})
+
+
+def test_real_alpaca_wire_normalization_has_no_provider_normalized_field():
+    from value_options.broker import ProviderResponse
+    from value_options.providers import ProductionCollectionProviders
+    def response(name,endpoint,feed='iex'):
+        raw=json.loads((Path(__file__).parent/'fixtures'/name).read_text())
+        timestamp=None
+        if endpoint=='clock': timestamp=datetime.fromisoformat(raw['timestamp'].replace('Z','+00:00'))
+        return ProviderResponse.capture(endpoint,'fixture-request',feed,timestamp,
+            datetime(2026,8,7,13,40,2,tzinfo=UTC),raw)
+    normalize=ProductionCollectionProviders._alpaca
+    assert normalize(response('alpaca_clock_real.json','clock'),'clock').normalized['timestamp']
+    assert 'timestamp' not in normalize(response('alpaca_calendar_real.json','calendar'),'calendar').normalized
+    assert normalize(response('alpaca_stock_quote_real.json','underlying_quote'),'underlying_quote').normalized['symbol']=='AAPL'
+    assert normalize(response('alpaca_option_quote_real.json','option_quote','opra'),'option_quote').normalized['strike']=='20'
+    assert normalize(response('alpaca_option_chain_real.json','option_chain','opra'),'option_chain').normalized['contracts'][0]['symbol']==CONTRACT

@@ -14,7 +14,7 @@ from .operations import PaperRun, seal_artifact, verify_artifact
 from .market_data import canonical_json
 import hashlib
 from .risk import PortfolioRisk
-from .config import live_read_only_enabled, preflight, redact
+from .config import live_read_only_enabled, paper_ledger_enabled, preflight, redact
 from .http import ExternalServiceError
 
 
@@ -79,15 +79,16 @@ def _verify_rule_results(rules):
     return rules["seal"]==hashlib.sha256(canonical_json(body)).hexdigest() and all(x[1] is True for x in rules["results"])
 
 
-def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary=None):
-    parser=argparse.ArgumentParser(prog="value-options"); sub=parser.add_subparsers(dest="command",required=True)
+def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary=None,
+         trusted_attestor=None):
+    parser=argparse.ArgumentParser(prog="value-options",allow_abbrev=False); sub=parser.add_subparsers(dest="command",required=True)
     i=sub.add_parser("inspect"); i.add_argument("packet",type=Path); i.add_argument("--as-of",required=True); i.add_argument("--output",type=Path,required=True)
     r=sub.add_parser("research-run"); r.add_argument("input",type=Path); r.add_argument("--at",required=True); r.add_argument("--output",type=Path,required=True)
-    rc=sub.add_parser("research-collect"); rc.add_argument("input",type=Path); rc.add_argument("--output",type=Path,required=True); rc.add_argument("--checkpoint",type=Path)
+    rc=sub.add_parser("research-collect",allow_abbrev=False); rc.add_argument("input",type=Path); rc.add_argument("--output",type=Path,required=True); rc.add_argument("--checkpoint",type=Path); rc.add_argument("--attestation-output",type=Path)
     d=sub.add_parser("decision-run"); d.add_argument("research",type=Path); d.add_argument("bundle",type=Path); d.add_argument("--at",required=True); d.add_argument("--submitted-at",required=True); d.add_argument("--decision-output",type=Path,required=True); d.add_argument("--submission-output",type=Path,required=True)
-    dc=sub.add_parser("decision-collect"); dc.add_argument("research",type=Path); dc.add_argument("portfolio",type=Path); dc.add_argument("proposal",type=Path); dc.add_argument("--decision-output",type=Path,required=True); dc.add_argument("--submission-output",type=Path,required=True); dc.add_argument("--checkpoint",type=Path)
+    dc=sub.add_parser("decision-collect",allow_abbrev=False); dc.add_argument("research",type=Path); dc.add_argument("portfolio",type=Path); dc.add_argument("proposal",type=Path); dc.add_argument("--decision-output",type=Path,required=True); dc.add_argument("--submission-output",type=Path,required=True); dc.add_argument("--checkpoint",type=Path); dc.add_argument("--attestation-output",type=Path)
     f=sub.add_parser("fill-run"); f.add_argument("decision",type=Path); f.add_argument("submission",type=Path); f.add_argument("quote",type=Path); f.add_argument("--as-of",required=True); f.add_argument("--output",type=Path,required=True)
-    fc=sub.add_parser("fill-collect"); fc.add_argument("research",type=Path); fc.add_argument("portfolio",type=Path); fc.add_argument("decision",type=Path); fc.add_argument("submission",type=Path); fc.add_argument("--output",type=Path,required=True); fc.add_argument("--checkpoint",type=Path)
+    fc=sub.add_parser("fill-collect",allow_abbrev=False); fc.add_argument("research",type=Path); fc.add_argument("portfolio",type=Path); fc.add_argument("decision",type=Path); fc.add_argument("submission",type=Path); fc.add_argument("--output",type=Path,required=True); fc.add_argument("--checkpoint",type=Path); fc.add_argument("--attestation-output",type=Path)
     rp=sub.add_parser("replay"); rp.add_argument("bundle",type=Path); rp.add_argument("--as-of",required=True); rp.add_argument("--output",type=Path,required=True)
     wr=sub.add_parser("workflow-rehearsal"); wr.add_argument("bundle",type=Path); wr.add_argument("--state",type=Path,required=True); wr.add_argument("--as-of",required=True); wr.add_argument("--output",type=Path,required=True)
     pf=sub.add_parser("preflight"); pf.add_argument("--live-read-only",action="store_true")
@@ -100,6 +101,9 @@ def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary
                 collection_providers=production_provider_factory()
             if utc_clock is None:
                 utc_clock=lambda: datetime.now(timezone.utc)
+            if args.command in {"decision-collect","fill-collect"} and trusted_attestor is None:
+                from .sheets import production_trusted_attestor_factory
+                trusted_attestor=production_trusted_attestor_factory()
             from .workflow import (AtomicCheckpoint, decision_collect, fill_collect,
                                    research_collect)
             inputs=[_read(args.input)] if args.command=="research-collect" else (
@@ -112,19 +116,32 @@ def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary
             recovered=checkpoint.read() if checkpoint else {}
             if recovered.get("complete"):
                 artifact=recovered["artifact"]
-                if args.command=="decision-collect": _write(args.decision_output,recovered["decision"])
+                expected={"research-collect":"research","decision-collect":"submission","fill-collect":"fill"}[args.command]
+                valid,reasons=verify_artifact(artifact,expected)
+                if not valid: raise ValueError("recovered checkpoint artifact invalid: "+"; ".join(reasons))
+                for envelope in recovered.get("attestations",[]):
+                    body={k:envelope[k] for k in ("record_id","immutable_location","receipt","exact_read_back","appended")}
+                    if envelope.get("envelope_seal")!=hashlib.sha256(canonical_json(body)).hexdigest():
+                        raise ValueError("recovered attestation envelope invalid")
+                if args.command=="decision-collect":
+                    decision_ok,decision_reasons=verify_artifact(recovered.get("decision",{}),"decision")
+                    if not decision_ok: raise ValueError("recovered decision invalid: "+"; ".join(decision_reasons))
+                    _write(args.decision_output,recovered["decision"])
             elif args.command=="research-collect":
                 artifact=research_collect(_read(args.input),collection_providers,utc_clock)
             elif args.command=="decision-collect":
-                decision_artifact,artifact=decision_collect(_read(args.research),_read(args.portfolio),_read(args.proposal),collection_providers,utc_clock)
+                decision_artifact,artifact=decision_collect(_read(args.research),_read(args.portfolio),_read(args.proposal),collection_providers,utc_clock,trusted_attestor)
                 _write(args.decision_output,decision_artifact)
             else:
-                artifact=fill_collect(_read(args.research),_read(args.portfolio),_read(args.decision),_read(args.submission),collection_providers,utc_clock)
+                artifact=fill_collect(_read(args.research),_read(args.portfolio),_read(args.decision),_read(args.submission),collection_providers,utc_clock,trusted_attestor)
             if checkpoint and not recovered.get("complete"):
                 data={"complete":True,"artifact":artifact}
                 if args.command=="decision-collect": data["decision"]=decision_artifact
                 checkpoint.write(data)
             attestation_evidence=[]
+            if sheet_boundary is None and paper_ledger_enabled():
+                from .sheets import production_sheet_boundary_factory
+                sheet_boundary=production_sheet_boundary_factory()
             if sheet_boundary is not None:
                 # The boundary itself requires the independent ledger sentinel.
                 if args.command=="decision-collect":
@@ -134,11 +151,14 @@ def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary
                 attested=sheet_boundary.append_activated(artifact,utc_clock())
                 attestation_evidence.append(_attestation_json(attested))
             if attestation_evidence:
-                artifact={**artifact,"workflow_attestations":attestation_evidence}
                 if checkpoint:
                     data={"complete":True,"artifact":artifact,"attestations":attestation_evidence}
                     if args.command=="decision-collect": data["decision"]=decision_to_append
                     checkpoint.write(data)
+            attestation_result={"artifact_id":artifact["artifact_id"],"attested":bool(attestation_evidence),
+                "envelopes":attestation_evidence,"classification":"PAPER ONLY","launch_eligible":False}
+            attestation_result["seal"]=hashlib.sha256(canonical_json(attestation_result)).hexdigest()
+            if args.attestation_output: _write(args.attestation_output,attestation_result)
             if args.command=="decision-collect": _write(args.submission_output,artifact)
         elif args.command in {"preflight","workflow-preflight"}:
             configured,artifact=preflight()
@@ -202,7 +222,8 @@ def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary
             persisted=_read(args.state) if args.command=="workflow-rehearsal" else None
             if persisted is not None:
                 from .workflow import portfolio_from_artifact
-                reconstructed=portfolio_from_artifact(persisted)
+                if trusted_attestor is None: raise ValueError("trusted portfolio attestor required for rehearsal")
+                reconstructed=portfolio_from_artifact(persisted,trusted_attestor)
                 run=PaperRun(DEFAULT_MANDATE,reconstructed)
             persisted_before=hashlib.sha256(canonical_json(persisted)).hexdigest() if persisted is not None else None
             before=run._state_fingerprint()

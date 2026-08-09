@@ -118,7 +118,9 @@ def assess(packet: EvidencePacket, *, as_of: datetime, cutoff: datetime,
     observed = n.get("timestamp")
     try: timestamp = datetime.fromisoformat(observed).astimezone(UTC) if isinstance(observed, str) else None
     except ValueError: timestamp = None
-    if timestamp is None: reasons.append("missing timestamp")
+    # Calendars describe session coverage, not a point-in-time market observation.
+    # Their provenance is bounded by requested_at/received_at instead.
+    if timestamp is None and packet.kind is not EvidenceKind.CALENDAR: reasons.append("missing timestamp")
     else:
         if timestamp > as_of: reasons.append("future-dated")
         if timestamp > cutoff: reasons.append("observed post-cutoff")

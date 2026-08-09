@@ -221,6 +221,25 @@ class FixtureAttestorPolicy:
     def trusts(self, receipt: AttestationReceipt) -> bool: return False
 
 
+class ProductionSheetAttestorPolicy:
+    """Authenticate provenance by independently reading the configured immutable row."""
+    def __init__(self, adapter: GoogleSheetsAdapter, spreadsheet_id: str):
+        self.adapter,self.external_system=adapter,"google-sheets:"+spreadsheet_id
+    def trusts(self, receipt: AttestationReceipt) -> bool:
+        if receipt.provenance!="authenticated-production" or receipt.external_system!=self.external_system:
+            return False
+        try: record=SheetRecord.from_row(self.adapter.read_row(receipt.immutable_location))
+        except (ValueError,ExternalServiceError): return False
+        return record.verify() and record.artifact_id==receipt.artifact_id and record.content_sha256==receipt.content_sha256
+
+
+def production_trusted_attestor_factory(environ: Mapping[str, str] | None = None, *, transport=None):
+    env=os.environ if environ is None else environ
+    adapter=GoogleSheetsAdapter(token_provider=google_service_account_token_provider(env),transport=transport,environ=env)
+    adapter.preflight(env.get("GOOGLE_SHEETS_SPREADSHEET_ID",""))
+    return ProductionSheetAttestorPolicy(adapter,env["GOOGLE_SHEETS_SPREADSHEET_ID"])
+
+
 class SheetAttestationBoundary:
     def __init__(self, port: AppendOnlySheetPort, external_system="google-sheets",
                  provenance="disconnected-fixture"):
@@ -277,3 +296,16 @@ class SheetAttestationBoundary:
             elif key not in expected_by_id: differences.append(f"{key}: unexpected")
             elif actual_by_id[key].row() != expected_by_id[key].row(): differences.append(f"{key}: mismatch")
         return tuple(duplicates + differences)
+
+
+def production_sheet_boundary_factory(environ: Mapping[str, str] | None = None, *,
+                                      transport: Transport | None = None):
+    """Construct and preflight the production append boundary only when activated."""
+    from .config import paper_ledger_enabled
+    env=os.environ if environ is None else environ
+    if not paper_ledger_enabled(env): raise ValueError("paper-ledger append is disabled")
+    adapter=GoogleSheetsAdapter(token_provider=google_service_account_token_provider(env),
+        transport=transport,environ=env)
+    adapter.preflight(env.get("GOOGLE_SHEETS_SPREADSHEET_ID", ""))
+    return SheetAttestationBoundary(adapter, external_system="google-sheets:"+
+        env["GOOGLE_SHEETS_SPREADSHEET_ID"], provenance="authenticated-production")

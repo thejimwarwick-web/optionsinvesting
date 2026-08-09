@@ -202,7 +202,7 @@ The operator workflow has four deliberately independent authority boundaries:
 4. **Live brokerage is prohibited.** There is no submit, cancel, replace, or live
    order capability. `PAPER ONLY` and `NO LIVE ORDER` remain immutable.
 
-Production collection uses the CLI provider factory only after the read-only sentinel is present. It also requires configured `VALUE_OPTIONS_CORPORATE_ACTION_URL`, `VALUE_OPTIONS_DIVIDEND_URL`, and `VALUE_OPTIONS_GBPUSD_URL` HTTPS read-only endpoints; preflight remains launch-unready if any is absent. Connections and appends are off unless their respective exact sentinel is present. CI supplies fixtures only, without network, credentials, or Sheet
+Production collection uses the CLI provider factory only after the read-only sentinel is present. It also requires the exact auxiliary-read sentinels `VALUE_OPTIONS_ENABLE_CORPORATE_ACTION_READS`, `VALUE_OPTIONS_ENABLE_DIVIDEND_READS`, and `VALUE_OPTIONS_ENABLE_GBPUSD_READS`; requests use only the fixed approved Alpaca host/path/query shapes; preflight remains launch-unready if any is absent. Connections and appends are off unless their respective exact sentinel is present. CI supplies fixtures only, without network, credentials, or Sheet
 writes. `workflow-rehearsal` is excluded and proves that cash, NAV, orders,
 positions, and launch status retain the same fingerprint.
 
@@ -222,7 +222,7 @@ Those four commands remain historical/file-driven and retain caller-supplied
 timestamps. They are never used by prospective collection. In contrast, the
 three `*-collect` commands expose no `--at`, `--submitted-at`, or `--as-of` option:
 an injected UTC clock supplies request, observation, receipt, decision,
-submission, read-back, and fill times. Atomic checkpoint files make completed
+submission, read-back, and fill times. Sheet evidence is written to a separate `--attestation-output`, never added to a sealed artifact. Atomic checkpoint files make completed
 provider work idempotent across restarts. If a Sheet append was interrupted after
 the external write, recovery locates and exactly reads back the existing row
 instead of appending another.
@@ -237,7 +237,7 @@ value-options workflow-rehearsal evidence-bundle.json --state fund-state.json --
 value-options inspect tests/fixtures/alpaca_opra_quote.json --as-of 2026-08-07T13:40:03Z --output artifacts/inspection.json
 ```
 
-The collect commands enforce research → externally reconciled portfolio snapshot → decision → submission → fill ancestry. Portfolio snapshots reconstruct actual cash, NAV, peak NAV/drawdown, holdings, option shorts and marks, so existing CSP collateral, covered calls, and issuer/sector usage enter the authoritative risk calculation.
+The collect commands enforce research → trusted, externally attested portfolio-snapshot envelope → decision → submission → fill ancestry. Portfolio snapshots reconstruct actual cash, NAV, peak NAV/drawdown, holdings, option shorts and marks, so existing CSP collateral, covered calls, and issuer/sector usage enter the authoritative risk calculation.
 Research accepts only underlying/thesis pairs; prospective code obtains clock,
 calendar, and every underlying quote through injected read-only provider ports. Decision uses fresh complete evidence, OPRA contract data, and
 explicit corporate-action, dividend, and GBP/USD provider ports, and the
