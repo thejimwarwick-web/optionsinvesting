@@ -191,8 +191,10 @@ The operator workflow has four deliberately independent authority boundaries:
    It permits only the allowlisted evidence GETs and never permits Sheet appends.
 2. **Paper-ledger append activation** separately uses
    `VALUE_OPTIONS_ENABLE_PAPER_LEDGER_APPEND=I_AUTHORIZE_APPEND_ONLY_PAPER_LEDGER`.
-   Before an append, `workflow-preflight` verifies spreadsheet identity, the
-   `Attestations` tab, and its exact seven-column header. Every actual append is
+   Offline `workflow-preflight` reports configuration presence only and explicitly
+   makes no schema-verification claim. Activated
+   `workflow-preflight --live-read-only` verifies spreadsheet identity, the `Attestations` tab, and
+   its exact seven-column header without writing. Every actual append is
    followed by an exact-range GET and immutable envelope; rows are never updated
    or deleted.
 3. **Paper-fund launch authorization** remains a separate verified launch
@@ -205,7 +207,7 @@ is present. CI supplies fixtures only, without network, credentials, or Sheet
 writes. `workflow-rehearsal` is excluded and proves that cash, NAV, orders,
 positions, and launch status retain the same fingerprint.
 
-## Offline sequential operational runs
+## Offline runs and prospective collection
 
 The operational path is deliberately three separate invocations. `research-run`
 seals its underlying-only input before option information is accepted;
@@ -217,21 +219,32 @@ ambiguous. Missing or malformed input produces a structured quarantine artifact.
 `replay` accepts combined historical bundles only as explicitly excluded,
 state-neutral test convenience. Every output says `PAPER ONLY` and `NO LIVE ORDER`:
 
+Those four commands remain historical/file-driven and retain caller-supplied
+timestamps. They are never used by prospective collection. In contrast, the
+three `*-collect` commands expose no `--at`, `--submitted-at`, or `--as-of` option:
+an injected UTC clock supplies request, observation, receipt, decision,
+submission, read-back, and fill times. Atomic checkpoint files make completed
+provider work idempotent across restarts. If a Sheet append was interrupted after
+the external write, recovery locates and exactly reads back the existing row
+instead of appending another.
+
 ```bash
-value-options workflow-preflight
-value-options research-collect research-input.json --at 2026-08-07T12:33:00Z --output artifacts/research.json
-value-options decision-collect artifacts/research.json decision-evidence.json --at 2026-08-07T13:42:00Z --submitted-at 2026-08-07T13:42:01Z --decision-output artifacts/decision.json --submission-output artifacts/submission.json
-value-options fill-collect artifacts/research.json artifacts/decision.json artifacts/submission.json post-submission-option-quote.json --as-of 2026-08-07T13:42:05Z --output artifacts/fill.json
-value-options workflow-rehearsal evidence-bundle.json --as-of 2026-08-07T13:40:30Z --output artifacts/rehearsal.json
+value-options workflow-preflight                         # configuration only
+value-options workflow-preflight --live-read-only       # activated provider/schema reads
+value-options research-collect research-input.json --output artifacts/research.json --checkpoint state/research.json
+value-options decision-collect artifacts/research.json proposed-operation.json --decision-output artifacts/decision.json --submission-output artifacts/submission.json --checkpoint state/decision.json
+value-options fill-collect artifacts/research.json artifacts/decision.json artifacts/submission.json --output artifacts/fill.json --checkpoint state/fill.json
+value-options workflow-rehearsal evidence-bundle.json --state fund-state.json --as-of 2026-08-07T13:40:30Z --output artifacts/rehearsal.json
 value-options inspect tests/fixtures/alpaca_opra_quote.json --as-of 2026-08-07T13:40:03Z --output artifacts/inspection.json
 ```
 
 The collect commands enforce research → decision → submission → fill ancestry.
-Research accepts only underlying/thesis pairs and clock, calendar, and underlying
-quote references. Decision uses fresh complete evidence, OPRA contract data, and
-the mandate/risk engine, then seals decision separately before simulated
-submission. Fill re-verifies all ancestors and requires a new exact-contract OPRA
-quote observed and received after submission; buys use ask and sells use bid.
+Research accepts only underlying/thesis pairs; prospective code obtains clock,
+calendar, and every underlying quote through injected read-only provider ports. Decision uses fresh complete evidence, OPRA contract data, and
+explicit corporate-action, dividend, and GBP/USD provider ports, and the
+mandate/risk engine, then seals decision separately before simulated
+submission. Fill re-verifies all ancestors and fetches a new exact-contract OPRA quote itself,
+observed and received after submission; buys use ask and sells use bid.
 
 Operational commands exit non-zero whenever a research, decision, submission, or
 fill stage is quarantined, invalid, or non-actionable, so schedulers cannot mistake

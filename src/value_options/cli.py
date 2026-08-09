@@ -71,22 +71,50 @@ def _verify_rule_results(rules):
     return rules["seal"]==hashlib.sha256(canonical_json(body)).hexdigest() and all(x[1] is True for x in rules["results"])
 
 
-def main(argv=None):
+def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary=None):
     parser=argparse.ArgumentParser(prog="value-options"); sub=parser.add_subparsers(dest="command",required=True)
     i=sub.add_parser("inspect"); i.add_argument("packet",type=Path); i.add_argument("--as-of",required=True); i.add_argument("--output",type=Path,required=True)
     r=sub.add_parser("research-run"); r.add_argument("input",type=Path); r.add_argument("--at",required=True); r.add_argument("--output",type=Path,required=True)
-    rc=sub.add_parser("research-collect"); rc.add_argument("input",type=Path); rc.add_argument("--at",required=True); rc.add_argument("--output",type=Path,required=True)
+    rc=sub.add_parser("research-collect"); rc.add_argument("input",type=Path); rc.add_argument("--output",type=Path,required=True); rc.add_argument("--checkpoint",type=Path)
     d=sub.add_parser("decision-run"); d.add_argument("research",type=Path); d.add_argument("bundle",type=Path); d.add_argument("--at",required=True); d.add_argument("--submitted-at",required=True); d.add_argument("--decision-output",type=Path,required=True); d.add_argument("--submission-output",type=Path,required=True)
-    dc=sub.add_parser("decision-collect"); dc.add_argument("research",type=Path); dc.add_argument("bundle",type=Path); dc.add_argument("--at",required=True); dc.add_argument("--submitted-at",required=True); dc.add_argument("--decision-output",type=Path,required=True); dc.add_argument("--submission-output",type=Path,required=True)
+    dc=sub.add_parser("decision-collect"); dc.add_argument("research",type=Path); dc.add_argument("proposal",type=Path); dc.add_argument("--decision-output",type=Path,required=True); dc.add_argument("--submission-output",type=Path,required=True); dc.add_argument("--checkpoint",type=Path)
     f=sub.add_parser("fill-run"); f.add_argument("decision",type=Path); f.add_argument("submission",type=Path); f.add_argument("quote",type=Path); f.add_argument("--as-of",required=True); f.add_argument("--output",type=Path,required=True)
-    fc=sub.add_parser("fill-collect"); fc.add_argument("research",type=Path); fc.add_argument("decision",type=Path); fc.add_argument("submission",type=Path); fc.add_argument("quote",type=Path); fc.add_argument("--as-of",required=True); fc.add_argument("--output",type=Path,required=True)
+    fc=sub.add_parser("fill-collect"); fc.add_argument("research",type=Path); fc.add_argument("decision",type=Path); fc.add_argument("submission",type=Path); fc.add_argument("--output",type=Path,required=True); fc.add_argument("--checkpoint",type=Path)
     rp=sub.add_parser("replay"); rp.add_argument("bundle",type=Path); rp.add_argument("--as-of",required=True); rp.add_argument("--output",type=Path,required=True)
-    wr=sub.add_parser("workflow-rehearsal"); wr.add_argument("bundle",type=Path); wr.add_argument("--as-of",required=True); wr.add_argument("--output",type=Path,required=True)
+    wr=sub.add_parser("workflow-rehearsal"); wr.add_argument("bundle",type=Path); wr.add_argument("--state",type=Path,required=True); wr.add_argument("--as-of",required=True); wr.add_argument("--output",type=Path,required=True)
     pf=sub.add_parser("preflight"); pf.add_argument("--live-read-only",action="store_true")
     wpf=sub.add_parser("workflow-preflight"); wpf.add_argument("--live-read-only",action="store_true")
     args=parser.parse_args(argv); run=_run(); artifact=None
     try:
-        if args.command in {"preflight","workflow-preflight"}:
+        if args.command in {"research-collect","decision-collect","fill-collect"}:
+            if collection_providers is None or utc_clock is None:
+                raise ValueError("prospective collection providers and UTC clock are unavailable")
+            from .workflow import (AtomicCheckpoint, decision_collect, fill_collect,
+                                   research_collect)
+            checkpoint=AtomicCheckpoint(args.checkpoint) if args.checkpoint else None
+            recovered=checkpoint.read() if checkpoint else {}
+            if recovered.get("complete"):
+                artifact=recovered["artifact"]
+                if args.command=="decision-collect": _write(args.decision_output,recovered["decision"])
+            elif args.command=="research-collect":
+                artifact=research_collect(_read(args.input),collection_providers,utc_clock)
+            elif args.command=="decision-collect":
+                decision_artifact,artifact=decision_collect(_read(args.research),_read(args.proposal),collection_providers,utc_clock)
+                _write(args.decision_output,decision_artifact)
+            else:
+                artifact=fill_collect(_read(args.research),_read(args.decision),_read(args.submission),collection_providers,utc_clock)
+            if checkpoint and not recovered.get("complete"):
+                data={"complete":True,"artifact":artifact}
+                if args.command=="decision-collect": data["decision"]=decision_artifact
+                checkpoint.write(data)
+            if sheet_boundary is not None:
+                # The boundary itself requires the independent ledger sentinel.
+                if args.command=="decision-collect":
+                    decision_to_append=recovered["decision"] if recovered.get("complete") else decision_artifact
+                    sheet_boundary.append_activated(decision_to_append,utc_clock())
+                sheet_boundary.append_activated(artifact,utc_clock())
+            if args.command=="decision-collect": _write(args.submission_output,artifact)
+        elif args.command in {"preflight","workflow-preflight"}:
             configured,artifact=preflight()
             if args.live_read_only:
                 if not configured: raise ValueError("live read-only preflight requires all environment credentials")
@@ -99,20 +127,17 @@ def main(argv=None):
                 sheet=adapter.preflight(__import__("os").environ["GOOGLE_SHEETS_SPREADSHEET_ID"])
                 artifact["live_read_only"]={"alpaca_clock_request_id":clock.request_id,
                     "alpaca_evidence_seal":clock.evidence_seal,"sheet":sheet,"writes":0,"orders":0}
+                artifact.update(provider_checks_activated=True,sheet_schema_verified=True)
         elif args.command=="inspect":
             p=load_packet(_read(args.packet)); result=assess(p,as_of=_time(args.as_of),cutoff=_time(args.as_of),max_age=None); artifact={"mode":"inspection",**asdict(result)}
-        elif args.command in {"research-run","research-collect"}:
+        elif args.command=="research-run":
             source=_read(args.input); _validate_research_input(source)
-            if args.command=="research-collect":
-                permitted={EvidenceKind.CLOCK.value,EvidenceKind.CALENDAR.value,EvidenceKind.UNDERLYING_QUOTE.value}
-                if any(x["name"] not in permitted for x in source.get("evidence_references",[])):
-                    raise ValueError("research permits only clock, calendar and underlying-quote evidence")
             candidates=tuple(ResearchCandidate(x["underlying"],x["thesis"]) for x in source["candidates"])
             refs=tuple(Observation(x["name"],x["value"],_time(x["available_at"])) for x in source.get("evidence_references",[]))
             record=run.create_research(_time(args.at),candidates,refs)
             payload={"research_id":record.packet_id,"mandate_version":record.mandate_version,"research_at":record.research_at.isoformat(),"candidates":[asdict(x) for x in record.shortlist],"evidence_references":[{"name":x.name,"value":x.value,"available_at":x.available_at.isoformat()} for x in record.observations],"rationale":record.rationale,"record_seal":record.seal}
             artifact=seal_artifact("research",payload)
-        elif args.command in {"decision-run","decision-collect"}:
+        elif args.command=="decision-run":
             research_artifact=_read(args.research); research=_research_from_artifact(research_artifact); source=_read(args.bundle); packets=[load_packet(x) for x in source.get("packets",[])]
             run.research_packet=research; spec=source["operation"]["instrument"]; op=source["operation"]
             order=Order(op["order_id"],_instrument(spec),Side(op["side"]),int(op["quantity"]),op["intent"])
@@ -123,15 +148,11 @@ def main(argv=None):
             decision_artifact=seal_artifact("decision",decision_payload); _write(args.decision_output,decision_artifact)
             submission_payload={"decision_artifact_id":decision_artifact["artifact_id"],"decision_id":decision.decision_id,"decision_at":submission.decision_at.isoformat(),"submitted_at":submission.submitted_at.isoformat(),"order":op,"rule_results_seal":rules["seal"],"evidence_packet_ids":[p.packet_id for p in packets]}
             artifact=seal_artifact("submission",submission_payload); _write(args.submission_output,artifact)
-        elif args.command in {"fill-run","fill-collect"}:
+        elif args.command=="fill-run":
             decision_artifact,supplied=_read(args.decision),_read(args.submission)
             dok,dreasons=verify_artifact(decision_artifact,"decision"); sok,sreasons=verify_artifact(supplied,"submission")
             if not dok or not sok: raise ValueError("; ".join(dreasons+sreasons))
             dpay,p=decision_artifact["payload"],supplied["payload"]
-            if args.command=="fill-collect":
-                research_artifact=_read(args.research); research=_research_from_artifact(research_artifact)
-                if dpay.get("research_artifact_id")!=research_artifact["artifact_id"] or dpay.get("research_id")!=research.packet_id:
-                    raise ValueError("decision parent research mismatch")
             if p["decision_artifact_id"]!=decision_artifact["artifact_id"] or p["decision_id"]!=dpay["decision_id"]: raise ValueError("submission parent decision mismatch")
             if canonical_json(p["order"])!=canonical_json(dpay["order"]): raise ValueError("submission order differs from sealed decision")
             if p["decision_at"]!=dpay["decision_at"] or _time(p["submitted_at"])<=_time(dpay["decision_at"]): raise ValueError("invalid decision/submission chronology")
@@ -146,13 +167,19 @@ def main(argv=None):
             fill["submission_artifact_id"]=supplied["artifact_id"]
             artifact=seal_artifact("fill",fill)
         else:
+            persisted=_read(args.state) if args.command=="workflow-rehearsal" else None
+            persisted_before=hashlib.sha256(canonical_json(persisted)).hexdigest() if persisted is not None else None
             before=run._state_fingerprint()
             report=run.excluded_replay(_packets(args.bundle),as_of=_time(args.as_of))
             after=run._state_fingerprint()
             artifact={"mode":"rehearsal" if args.command=="workflow-rehearsal" else "replay",
                 **report.jsonable(),"fund_state_unchanged":before==after,
                 "cash_nav_orders_positions_launch_unchanged":before==after}
-    except (KeyError,TypeError,ValueError,ArithmeticError,ExternalServiceError) as error:
+            if persisted is not None:
+                persisted_after=hashlib.sha256(canonical_json(_read(args.state))).hexdigest()
+                artifact.update(persisted_state_fingerprint=persisted_before,
+                    persisted_state_unchanged=persisted_before==persisted_after)
+    except (KeyError,TypeError,ValueError,ArithmeticError,RuntimeError,ExternalServiceError) as error:
         artifact=_quarantine(args.command,[redact(str(error)) or error.__class__.__name__])
     artifact.update({"classification":"PAPER ONLY","order_policy":"NO LIVE ORDER"})
     output=getattr(args,"output",None)

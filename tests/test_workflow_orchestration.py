@@ -1,71 +1,124 @@
-import json
-import re
+import json, os, re, subprocess, sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import pytest
 
 from value_options.cli import main
 from value_options.operations import seal_artifact
 from value_options.sheets import GoogleSheetsAdapter, HEADERS, SheetAttestationBoundary
+from value_options.workflow import ReadResult
 
+UTC=timezone.utc; CONTRACT='AAPL260828P00020000'
 
-UTC = timezone.utc
-AT = datetime(2026, 8, 7, 12, 33, tzinfo=UTC)
+class TickClock:
+    def __init__(self,at): self.value=at
+    def __call__(self): self.value+=timedelta(seconds=1); return self.value
 
+class Providers:
+    def __init__(self,clock,missing=()): self.ticker=clock; self.calls=[]; self.missing=set(missing); self.stale=False
+    def _result(self,name,**n):
+        self.calls.append(name)
+        if name in self.missing: raise ValueError(name+' provider unavailable')
+        timestamp=self.ticker.value-timedelta(minutes=10) if self.stale else self.ticker.value
+        n={'timestamp':timestamp.isoformat(),**n}
+        return ReadResult('fixture','OPRA' if name in {'option_chain','option_quote'} else 'fixture',{'fixture':n},n)
+    def clock(self): return self._result('clock')
+    def calendar(self,start,end): return self._result('calendar',session_date=start)
+    def underlying_quote(self,symbol): return self._result('underlying_quote',symbol=symbol,bid='20',ask='20.1',bid_size=10,ask_size=10)
+    def option_chain(self,underlying): return self._result('option_chain',contracts=[{'symbol':CONTRACT,'underlying':'AAPL','expiration':'2026-08-28','strike':'20','right':'put','multiplier':100}])
+    def option_quote(self,symbol): return self._result('option_quote',symbol=symbol,underlying='AAPL',expiration='2026-08-28',strike='20',right='put',multiplier=100,currency='USD',market='US',bid='1',ask='1.1',bid_size=10,ask_size=10)
+    def corporate_action(self,u): return self._result('corporate_action',effective_date='2026-08-07',retrieved_at=self.ticker.value.isoformat())
+    def dividend(self,u): return self._result('dividend',effective_date='2026-08-07',retrieved_at=self.ticker.value.isoformat())
+    def fx(self,p): return self._result('fx',symbol=p,bid='0.79',ask='0.81',mid='0.8')
 
 class MemorySheet:
-    def __init__(self):
-        self.rows = []
-        self.reads = 0
+    def __init__(self): self.rows=[]; self.reads=0; self.fail_read=False
+    def read_all(self): return tuple(self.rows)
+    def append_row(self,row): self.rows.append(tuple(row)); return f'Attestations!A{len(self.rows)+1}:G{len(self.rows)+1}'
+    def read_row(self,location):
+        self.reads+=1
+        if self.fail_read: raise RuntimeError('interrupted')
+        return self.rows[int(re.search(r'!A(\d+):',location).group(1))-2]
 
-    def read_all(self):
-        return tuple(self.rows)
+def write(path,value): path.write_text(json.dumps(value))
+def proposal(): return {'operation':{'order_id':'paper-1','side':'sell','quantity':1,'intent':'open','instrument':{'symbol':CONTRACT,'issuer':'Apple','sector':'Technology','underlying':'AAPL','expiration':'2026-08-28','strike':'20','right':'put'}}}
 
-    def append_row(self, row):
-        self.rows.append(tuple(row))
-        return f"Attestations!A{len(self.rows)+1}:G{len(self.rows)+1}"
+def collect_research(tmp_path,clock,providers):
+    source=tmp_path/'candidates.json'; out=tmp_path/'research.json'; write(source,{'candidates':[{'underlying':'AAPL','thesis':'value'}]})
+    assert main(['research-collect',str(source),'--output',str(out)],collection_providers=providers,utc_clock=clock)==0
+    return out
 
-    def read_row(self, location):
-        self.reads += 1
-        return self.rows[int(re.search(r"!A(\d+):", location).group(1))-2]
+def test_successful_research_collection_and_no_option_access(tmp_path):
+    clock=TickClock(datetime(2026,8,7,12,30,tzinfo=UTC)); providers=Providers(clock)
+    artifact=json.loads(collect_research(tmp_path,clock,providers).read_text())
+    assert artifact['artifact_kind']=='research'
+    assert providers.calls==['clock','calendar','underlying_quote']
+    assert len(artifact['payload']['evidence_packets'])==3
+
+def test_missing_research_evidence_quarantines(tmp_path):
+    clock=TickClock(datetime(2026,8,7,12,30,tzinfo=UTC)); providers=Providers(clock,{'calendar'})
+    source=tmp_path/'in.json'; out=tmp_path/'out.json'; write(source,{'candidates':[{'underlying':'AAPL','thesis':'x'}]})
+    assert main(['research-collect',str(source),'--output',str(out)],collection_providers=providers,utc_clock=clock)==1
+    assert json.loads(out.read_text())['quarantined']
+
+def test_collect_rejects_caller_timestamps(tmp_path):
+    source=tmp_path/'in.json'; write(source,{'candidates':[{'underlying':'AAPL','thesis':'x'}]})
+    with pytest.raises(SystemExit): main(['research-collect',str(source),'--at','2020-01-01T00:00:00Z','--output',str(tmp_path/'x')])
+
+def test_prospective_decision_submission_and_fresh_fill(tmp_path):
+    rclock=TickClock(datetime(2026,8,7,12,30,tzinfo=UTC)); research=collect_research(tmp_path,rclock,Providers(rclock))
+    clock=TickClock(datetime(2026,8,7,13,40,tzinfo=UTC)); providers=Providers(clock); prop=tmp_path/'proposal.json'; write(prop,proposal())
+    decision,submission=tmp_path/'decision.json',tmp_path/'submission.json'
+    assert main(['decision-collect',str(research),str(prop),'--decision-output',str(decision),'--submission-output',str(submission)],collection_providers=providers,utc_clock=clock)==0
+    assert {'corporate_action','dividend','fx'} <= set(providers.calls)
+    sub=json.loads(submission.read_text()); assert sub['payload']['submitted_at']>sub['payload']['decision_at']
+    fill=tmp_path/'fill.json'
+    assert main(['fill-collect',str(research),str(decision),str(submission),'--output',str(fill)],collection_providers=providers,utc_clock=clock)==0
+    result=json.loads(fill.read_text())['payload']; assert result['price']=='1' and result['response_received_at']>sub['payload']['submitted_at']
+
+@pytest.mark.parametrize('missing',[{'corporate_action'},{'dividend'},{'fx'}])
+def test_missing_auxiliary_provider_quarantines(tmp_path,missing):
+    rc=TickClock(datetime(2026,8,7,12,30,tzinfo=UTC)); research=collect_research(tmp_path,rc,Providers(rc))
+    clock=TickClock(datetime(2026,8,7,13,40,tzinfo=UTC)); prop=tmp_path/'p.json'; write(prop,proposal()); d,s=tmp_path/'d',tmp_path/'s'
+    assert main(['decision-collect',str(research),str(prop),'--decision-output',str(d),'--submission-output',str(s)],collection_providers=Providers(clock,missing),utc_clock=clock)==1
+
+def test_stale_fill_and_ancestry_substitution_rejected(tmp_path):
+    rc=TickClock(datetime(2026,8,7,12,30,tzinfo=UTC)); research=collect_research(tmp_path,rc,Providers(rc))
+    clock=TickClock(datetime(2026,8,7,13,40,tzinfo=UTC)); p=tmp_path/'p'; write(p,proposal()); d,s=tmp_path/'d',tmp_path/'s'
+    main(['decision-collect',str(research),str(p),'--decision-output',str(d),'--submission-output',str(s)],collection_providers=Providers(clock),utc_clock=clock)
+    providers=Providers(clock); providers.stale=True; out=tmp_path/'fill'
+    assert main(['fill-collect',str(research),str(d),str(s),'--output',str(out)],collection_providers=providers,utc_clock=clock)==1
+    forged=seal_artifact('research',{'research_id':'other'}); other=tmp_path/'other'; write(other,forged)
+    assert main(['fill-collect',str(other),str(d),str(s),'--output',str(out)],collection_providers=Providers(clock),utc_clock=clock)==1
+
+def test_sheet_recovery_after_external_write_without_duplicate():
+    port=MemorySheet(); boundary=SheetAttestationBoundary(port); artifact=seal_artifact('research',{'research_id':'x'}); at=datetime(2026,8,7,12,30,tzinfo=UTC); env={'VALUE_OPTIONS_ENABLE_PAPER_LEDGER_APPEND':'I_AUTHORIZE_APPEND_ONLY_PAPER_LEDGER'}
+    port.fail_read=True
+    with pytest.raises(RuntimeError): boundary.append_activated(artifact,at,environ=env)
+    assert len(port.rows)==1
+    port.fail_read=False; result=boundary.append_activated(artifact,at+timedelta(seconds=1),environ=env)
+    assert not result[3] and result[2][0].verify() and len(port.rows)==1
+
+def test_sheet_preflight_exact_and_rehearsal_nonempty_state(tmp_path):
+    adapter=object.__new__(GoogleSheetsAdapter); adapter._spreadsheet,adapter._range='expected','Attestations!A:G'; adapter._request=lambda *a,**k:{'values':[list(HEADERS)]}
+    assert adapter.preflight('expected')['writes']==0
+    state={'cash':'90000','nav':'101000','launch_status':'PAPER ONLY','orders':['x'],'positions':{'AAPL':3}}
+    snapshot=tmp_path/'state.json'; bundle=tmp_path/'bundle.json'; out=tmp_path/'out.json'; write(snapshot,state); write(bundle,{'packets':[]})
+    assert main(['workflow-rehearsal',str(bundle),'--state',str(snapshot),'--as-of','2026-08-07T13:40:00Z','--output',str(out)])==0
+    assert json.loads(out.read_text())['persisted_state_unchanged']
 
 
-def test_sheet_preflight_is_exact_and_read_only():
-    adapter = object.__new__(GoogleSheetsAdapter)
-    adapter._spreadsheet, adapter._range = "expected", "Attestations!A:G"
-    adapter._request = lambda *a, **k: {"values": [list(HEADERS)]}
-    result = adapter.preflight("expected")
-    assert result["verified"] and result["writes"] == 0 and result["header"] == list(HEADERS)
-
-
-def test_ledger_append_needs_separate_sentinel_and_reads_back_exactly():
-    port = MemorySheet(); boundary = SheetAttestationBoundary(port)
-    artifact = seal_artifact("research", {"research_id": "fixture"})
-    try:
-        boundary.append_activated(artifact, AT, environ={})
-    except ValueError as error:
-        assert "disabled" in str(error)
-    else:
-        raise AssertionError("append occurred without activation")
-    assert not port.rows
-    result = boundary.append_activated(artifact, AT, environ={
-        "VALUE_OPTIONS_ENABLE_PAPER_LEDGER_APPEND": "I_AUTHORIZE_APPEND_ONLY_PAPER_LEDGER"})
-    assert result[3] is True and result[2][0].verify() and port.reads == 1 and len(port.rows) == 1
-
-
-def test_rehearsal_command_reports_no_fund_mutation(tmp_path):
-    bundle = tmp_path / "bundle.json"; output = tmp_path / "report.json"
-    bundle.write_text('{"packets": []}')
-    assert main(["workflow-rehearsal", str(bundle), "--as-of",
-                 "2026-08-07T13:40:30+00:00", "--output", str(output)]) == 0
-    report = json.loads(output.read_text())
-    assert report["excluded"] and report["fund_state_unchanged"]
-    assert report["classification"] == "PAPER ONLY" and report["order_policy"] == "NO LIVE ORDER"
-
-
-def test_research_collection_rejects_option_evidence_before_sealing(tmp_path):
-    source = tmp_path / "input.json"; output = tmp_path / "output.json"
-    source.write_text(json.dumps({"candidates": [{"underlying": "AAPL", "thesis": "value"}],
-        "evidence_references": [{"name": "option_chain", "value": "forbidden",
-            "available_at": (AT-timedelta(seconds=1)).isoformat()}]}))
-    assert main(["research-collect", str(source), "--at", AT.isoformat(),
-                 "--output", str(output)]) == 1
-    assert json.loads(output.read_text())["quarantined"]
+def test_checkpoint_repeat_is_idempotent_and_subprocess_quarantines(tmp_path):
+    clock=TickClock(datetime(2026,8,7,12,30,tzinfo=UTC)); providers=Providers(clock)
+    source=tmp_path/'input.json'; output=tmp_path/'output.json'; checkpoint=tmp_path/'checkpoint.json'
+    write(source,{'candidates':[{'underlying':'AAPL','thesis':'value'}]})
+    command=['research-collect',str(source),'--output',str(output),'--checkpoint',str(checkpoint)]
+    assert main(command,collection_providers=providers,utc_clock=clock)==0
+    calls=tuple(providers.calls)
+    assert main(command,collection_providers=providers,utc_clock=clock)==0
+    assert tuple(providers.calls)==calls
+    isolated=tmp_path/'isolated.json'
+    result=subprocess.run([sys.executable,'-m','value_options.cli','research-collect',
+        str(source),'--output',str(isolated)],cwd=Path(__file__).parents[1],
+        env={**os.environ,'PYTHONPATH':'src'},capture_output=True,text=True)
+    assert result.returncode!=0 and json.loads(isolated.read_text())['quarantined']

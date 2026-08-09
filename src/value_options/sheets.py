@@ -227,11 +227,12 @@ class SheetAttestationBoundary:
 
     def append(self, artifact: Mapping[str, Any], at: datetime) -> tuple[SheetRecord, str, bool]:
         record = SheetRecord.create(artifact, at)
-        for row in self.port.read_all():
+        for index, row in enumerate(self.port.read_all(), start=2):
             existing = SheetRecord.from_row(row)
-            if existing.record_id == record.record_id:
-                if existing.row() != record.row(): raise ValueError("duplicate record ID has different content")
-                return existing, f"record:{existing.record_id}", False
+            if existing.artifact_id == record.artifact_id:
+                if not existing.verify() or existing.payload_json != record.payload_json:
+                    raise ValueError("duplicate artifact ID has different content")
+                return existing, f"Attestations!A{index}:G{index}", False
         return record, self.port.append_row(record.row()), True
 
     def append_activated(self, artifact: Mapping[str, Any], at: datetime, *, environ=None):
@@ -240,12 +241,8 @@ class SheetAttestationBoundary:
         if not paper_ledger_enabled(environ):
             raise ValueError("paper-ledger append is disabled")
         record, location, appended = self.append(artifact, at)
-        # Recovery of an already-present record uses its stable synthetic location;
-        # no second write is attempted. Callers retain the original receipt.
-        if not appended:
-            return record, location, None, False
         receipt, exact = self.read_back(record, location, at)
-        return record, location, (receipt, exact), True
+        return record, location, (receipt, exact), appended
 
     def read_back(self, record: SheetRecord, location: str, at: datetime) -> tuple[AttestationReceipt, Mapping[str, Any]]:
         require_utc(at, "read_back_at")

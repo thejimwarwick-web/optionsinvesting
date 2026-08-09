@@ -37,6 +37,7 @@ def preflight(environ: Mapping[str, str] | None = None) -> tuple[bool, dict]:
     status = configuration_status(environ)
     present = all(status.values())
     return present, {"configuration": status, "launch_eligible": False,
+                     "provider_checks_activated": False, "sheet_schema_verified": False,
                      "classification": "PAPER ONLY", "order_policy": "NO LIVE ORDER"}
 
 
