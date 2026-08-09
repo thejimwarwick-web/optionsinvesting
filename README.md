@@ -56,6 +56,45 @@ same state, and reconciliation reports missing, unexpected, or mismatched record
 `AppendOnlyLedgerSink` is only a port for a future Google Sheets adapter.
 `ReadOnlyAlpaca` deliberately exposes reads only.
 
+## External attestation boundaries (not connected)
+
+`SheetAttestationBoundary` serializes Google Sheets-compatible rows and permits
+only append and read operations. It idempotently compares duplicate record IDs,
+verifies exact read-back content before issuing an external receipt, reconciles
+expected history, and represents fixes as new correction rows pointing at the old
+row. It has no update or delete operation. No Google SDK or real spreadsheet ID is
+used by this repository or CI.
+
+An immutable attested envelope retains a deep snapshot of the complete original
+artifact, its local ID and seal, the exact external read-back, a content-addressed
+and sealed receipt, explicit parent IDs, and its own content-addressed ID and seal.
+Verification recursively checks artifact-specific ancestry instead of trusting
+caller-supplied attestation or launch Booleans. Launch eligibility is a verification
+result, not an envelope field, and requires every ancestor plus receipt provenance
+authenticated by an explicitly configured trusted-attestor policy. The disconnected
+fixture policy is never trusted. Attestation never changes `PAPER ONLY` or
+`NO LIVE ORDER`.
+
+The Alpaca port exposes only clock, calendar, underlying quote, option-chain, and
+option-quote reads. Captured evidence retains the untouched response, provider and
+receipt timestamps, request ID, feed identity, and raw-response hash. CI uses the
+injected fixture adapter and performs no network access.
+
+### Future manual configuration
+
+When separately reviewed adapters are implemented, operators must supply
+`ALPACA_API_KEY_ID`, `ALPACA_API_SECRET_KEY`, `GOOGLE_SHEETS_SPREADSHEET_ID`, and
+`GOOGLE_SERVICE_ACCOUNT_JSON` as process environment variables. Credentials must
+never be command-line arguments, logs, artifacts, repository files, or spreadsheet
+values. The safe configuration check displays names and booleans only:
+
+```bash
+value-options preflight
+```
+
+It returns non-zero when any value is absent and always remains launch-ineligible.
+Configuration alone does not authorize connection, ledger access, or fund launch.
+
 Exchange sessions are never inferred from weekdays. Live and replay processing
 require a verified, sealed `MarketCalendarEvidence` observation whose coverage
 contains the event and a subsequent open session. The read-only evidence port is
