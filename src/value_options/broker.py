@@ -10,7 +10,7 @@ import os
 import re
 from urllib.parse import urlencode, urlsplit
 
-from .http import Transport, UrllibTransport
+from .http import ExternalServiceError, Transport, UrllibTransport
 
 from .market_data import canonical_json
 from .models import require_utc
@@ -21,7 +21,7 @@ class ProviderResponse:
     endpoint: str
     request_id: str
     feed: str
-    provider_timestamp: datetime
+    provider_timestamp: datetime | None
     received_at: datetime
     raw: Any
     raw_sha256: str
@@ -30,19 +30,27 @@ class ProviderResponse:
 
     @classmethod
     def capture(cls, endpoint: str, request_id: str, feed: str,
-                provider_timestamp: datetime, received_at: datetime, raw: Any,
+                provider_timestamp: datetime | None, received_at: datetime, raw: Any,
                 raw_response: bytes | None = None):
-        require_utc(provider_timestamp, "provider_timestamp")
+        if provider_timestamp is not None: require_utc(provider_timestamp, "provider_timestamp")
         require_utc(received_at, "received_at")
         if not request_id or not feed: raise ValueError("request ID and feed identity are required")
-        if received_at < provider_timestamp: raise ValueError("response received before provider timestamp")
+        if provider_timestamp is not None and received_at < provider_timestamp: raise ValueError("response received before provider timestamp")
         raw_bytes = canonical_json(raw) if raw_response is None else bytes(raw_response)
         digest = hashlib.sha256(raw_bytes).hexdigest()
         seal = hashlib.sha256(canonical_json({"endpoint": endpoint, "request_id": request_id,
-            "feed": feed, "provider_timestamp": provider_timestamp.isoformat(),
+            "feed": feed, "provider_timestamp": provider_timestamp.isoformat() if provider_timestamp else None,
             "received_at": received_at.isoformat(), "raw_sha256": digest})).hexdigest()
         return cls(endpoint, request_id, feed, provider_timestamp, received_at, raw,
                    digest, seal, raw_bytes)
+
+    @property
+    def timestamp_available(self): return self.provider_timestamp is not None
+
+    def require_provider_timestamp(self):
+        if self.provider_timestamp is None:
+            raise ValueError("evidence quarantined: provider timestamp unavailable")
+        return self.provider_timestamp
 
 
 class AlpacaReadOnlyClient:
@@ -70,15 +78,20 @@ class AlpacaReadOnlyClient:
         if not approved or any(x in path.lower() for x in ("order", "account", "cancel", "replace")):
             raise ValueError("unknown or write-side Alpaca endpoint")
         url = f"https://{host}{path}" + ("?" + urlencode(query) if query else "")
-        response = self._transport.request("GET", url, headers={"APCA-API-KEY-ID": self._key,
-            "APCA-API-SECRET-KEY": self._secret}, body=None)
+        try:
+            response = self._transport.request("GET", url, headers={"APCA-API-KEY-ID": self._key,
+                "APCA-API-SECRET-KEY": self._secret}, body=None)
+        except Exception:
+            raise ExternalServiceError("Alpaca read request failed") from None
         final = urlsplit(response.url)
         if final.scheme != "https" or final.hostname != host: raise ValueError("redirect or response from unapproved host")
         if 300 <= response.status < 400: raise ValueError("redirect rejected")
         if response.status != 200: raise ValueError(f"Alpaca read failed with HTTP {response.status}")
-        raw = json.loads(response.body)
+        try: raw = json.loads(response.body)
+        except (TypeError, json.JSONDecodeError, UnicodeDecodeError):
+            raise ExternalServiceError("Alpaca returned an invalid response") from None
         now = datetime.now(timezone.utc)
-        timestamp = _provider_timestamp(raw, now)
+        timestamp = _provider_timestamp(endpoint, raw)
         request_id = response.headers.get("x-request-id") or response.headers.get("X-Request-ID")
         if not request_id: raise ValueError("Alpaca response omitted request ID")
         return ProviderResponse.capture(endpoint, request_id, feed, timestamp, now, raw, response.body)
@@ -90,16 +103,22 @@ class AlpacaReadOnlyClient:
     def option_quote(self, symbol): return self._get(self.DATA_HOST, "/v1beta1/options/quotes/latest", {"symbols": _symbol(symbol), "feed": "opra"}, "option_quote", "opra")
 
 
-def _provider_timestamp(value, fallback):
-    candidates = [value.get(x) for x in ("timestamp", "t") if isinstance(value, dict)]
-    if isinstance(value, dict):
-        for child in value.values():
-            if isinstance(child, dict): candidates.extend(child.get(x) for x in ("timestamp", "t") if child.get(x))
+def _provider_timestamp(endpoint, value):
+    candidates = []
+    if isinstance(value, dict) and endpoint == "clock": candidates.append(value.get("timestamp"))
+    if isinstance(value, dict) and endpoint == "underlying_quote": candidates.append((value.get("quote") or {}).get("t"))
+    if isinstance(value, dict) and endpoint == "option_quote":
+        candidates.extend(x.get("t") for x in (value.get("quotes") or {}).values() if isinstance(x, dict))
+    if isinstance(value, dict) and endpoint == "option_chain":
+        candidates.extend((x.get("latestQuote") or {}).get("t") for x in
+            (value.get("snapshots") or {}).values() if isinstance(x, dict))
     for candidate in candidates:
         if isinstance(candidate, str):
-            try: return datetime.fromisoformat(candidate.replace("Z", "+00:00"))
-            except ValueError: pass
-    return fallback
+            try:
+                parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+                if parsed.tzinfo is not None: return parsed.astimezone(timezone.utc)
+            except (TypeError, ValueError): pass
+    return None
 
 
 def _symbol(value):

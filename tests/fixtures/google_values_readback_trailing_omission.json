@@ -1,0 +1,5 @@
+{
+  "range": "Attestations!A2:G2",
+  "majorDimension": "ROWS",
+  "values": [["id", "artifact", "artifact-1", "hash", "2026-08-07T13:42:00+00:00", "{}"]]
+}

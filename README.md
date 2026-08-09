@@ -73,8 +73,15 @@ operation (Google uses POST for append). It has no update, clear, batch-update, 
 delete surface. The append uses `RAW` and `INSERT_ROWS`, requires Google's response
 to echo exactly one identical row, and the attestation boundary then GETs the exact
 returned range and compares every cell before creating a trusted receipt.
+Google's documented omission of trailing empty cells is normalized by padding only
+the missing tail to the fixed seven-column schema; internal omissions, extra cells,
+and other differences still fail. The exact header row is explicitly excluded from
+attestation records.
 The endpoint shapes follow the official [Alpaca Trading/Data API documentation](https://docs.alpaca.markets/reference)
 and [Google Sheets Values API documentation](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values).
+Service-account metadata must name exactly
+`https://oauth2.googleapis.com/token`; OAuth uses the same no-redirect transport
+policy and rejects every other URL or redirected response.
 
 `SheetAttestationBoundary` serializes Google Sheets-compatible rows and permits
 only append and read operations. It idempotently compares duplicate record IDs,
@@ -97,6 +104,10 @@ The Alpaca port exposes only clock, calendar, underlying quote, option-chain, an
 option-quote reads. Captured evidence retains the untouched response, provider and
 receipt timestamps, request ID, feed identity, and raw-response hash. CI uses the
 injected fixture adapter and performs no network access.
+Only timestamps actually present in the documented clock, latest-quote, or snapshot
+response structures are recorded. Calendar and malformed/missing timestamp fields
+remain explicitly unavailable, and timestamp-dependent use quarantines them rather
+than substituting local receipt time.
 
 ### Future manual configuration
 

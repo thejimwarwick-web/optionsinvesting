@@ -7,6 +7,10 @@ import urllib.error
 import urllib.request
 
 
+class ExternalServiceError(RuntimeError):
+    """A deliberately context-free error safe to expose in diagnostics."""
+
+
 @dataclass(frozen=True)
 class HttpResponse:
     status: int
@@ -37,5 +41,10 @@ class UrllibTransport:
         except urllib.error.HTTPError as error:
             # Includes redirects because redirect following is disabled.
             response = error
-        raw = response.read()
-        return HttpResponse(response.status, dict(response.headers.items()), raw, response.geturl())
+        except (urllib.error.URLError, TimeoutError, OSError):
+            raise ExternalServiceError("external network request failed") from None
+        try:
+            raw = response.read()
+            return HttpResponse(response.status, dict(response.headers.items()), raw, response.geturl())
+        except (TimeoutError, OSError):
+            raise ExternalServiceError("external network response failed") from None

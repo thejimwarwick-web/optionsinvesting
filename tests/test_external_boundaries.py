@@ -1,14 +1,17 @@
 from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
+import json
+from pathlib import Path
 
 import pytest
 
 from value_options.attestation import (AttestationReceipt, AttestedArtifact,
     create_attested_artifact, verify_attested_artifact)
 from value_options.broker import AlpacaReadOnlyClient, FixtureAlpaca, ProviderResponse, ReadOnlyAlpaca
-from value_options.http import HttpResponse
-from value_options.sheets import GoogleSheetsAdapter
+from value_options.http import ExternalServiceError, HttpResponse
+from value_options.sheets import (GoogleSheetsAdapter, HEADERS,
+    _NoRedirectGoogleAuthRequest, google_service_account_token_provider, normalize_values_row)
 from value_options.cli import main
 from value_options.config import preflight, redact
 from value_options.operations import seal_artifact
@@ -179,3 +182,83 @@ def test_google_adapter_append_allowlist_and_exact_echo():
     method,url,headers,body=transport.calls[0]
     assert method=="POST" and ":append?" in url and b'"values"' in body
     assert "token" not in body.decode()
+
+
+class QueueHttp:
+    def __init__(self, *responses): self.responses=list(responses)
+    def request(self, method, url, *, headers, body=None): return self.responses.pop(0)
+
+
+def test_real_shaped_google_trailing_omission_append_and_readback():
+    fixture=Path(__file__).parent/"fixtures"
+    append=(fixture/"google_values_append_trailing_omission.json").read_bytes()
+    read=(fixture/"google_values_readback_trailing_omission.json").read_bytes()
+    row=["id","artifact","artifact-1","hash",AT.isoformat(),"{}",""]
+    transport=QueueHttp(
+        HttpResponse(200,{},append,"https://sheets.googleapis.com/v4/spreadsheets/fixture_sheet/values/Attestations%21A%3AG:append"),
+        HttpResponse(200,{},read,"https://sheets.googleapis.com/v4/spreadsheets/fixture_sheet/values/Attestations%21A2%3AG2"))
+    adapter=GoogleSheetsAdapter(token_provider=lambda:"fixture-token",transport=transport,environ={
+        "GOOGLE_SHEETS_SPREADSHEET_ID":"fixture_sheet","GOOGLE_SERVICE_ACCOUNT_JSON":"{}"})
+    location=adapter.append_row(row)
+    assert adapter.read_row(location)==row
+    assert normalize_values_row(row[:-1])==row
+    with pytest.raises(ValueError,match="width"): normalize_values_row(row+[""])
+
+
+def test_google_read_all_excludes_exact_header_but_not_data():
+    body=json.dumps({"values":[list(HEADERS),["id","artifact","a","h",AT.isoformat(),"{}"]]}).encode()
+    transport=FakeHttp(HttpResponse(200,{},body,
+        "https://sheets.googleapis.com/v4/spreadsheets/sheet_fixture/values/Attestations%21A%3AG"))
+    adapter=GoogleSheetsAdapter(token_provider=lambda:"token",transport=transport,environ={
+        "GOOGLE_SHEETS_SPREADSHEET_ID":"sheet_fixture","GOOGLE_SERVICE_ACCOUNT_JSON":"{}"})
+    assert adapter.read_all()==(("id","artifact","a","h",AT.isoformat(),"{}",""),)
+
+
+def test_oauth_transport_rejects_redirect_and_unexpected_endpoint_without_leaks():
+    secret="super-secret-credential"
+    redirected=FakeHttp(HttpResponse(302,{"Location":f"https://evil.test/{secret}"},secret.encode(),
+        f"https://evil.test/{secret}"))
+    oauth=_NoRedirectGoogleAuthRequest(redirected)
+    with pytest.raises(ExternalServiceError) as caught:
+        oauth("https://oauth2.googleapis.com/token",method="POST",body=secret.encode())
+    assert secret not in str(caught.value)
+    with pytest.raises(ExternalServiceError,match="rejected"):
+        oauth("https://accounts.google.com/token",method="POST")
+
+
+def test_service_account_token_uri_must_be_exact_official_endpoint():
+    hostile=json.dumps({"token_uri":"https://oauth2.googleapis.com.evil.test/token",
+        "private_key":"credential-that-must-not-leak"})
+    with pytest.raises(ValueError,match="not approved") as caught:
+        google_service_account_token_provider({"GOOGLE_SERVICE_ACCOUNT_JSON":hostile})
+    assert "credential-that-must-not-leak" not in str(caught.value)
+
+
+def test_missing_provider_timestamp_is_unavailable_and_quarantined_not_fabricated():
+    wire=b'{"is_open":true}'
+    client=AlpacaReadOnlyClient(transport=FakeHttp(HttpResponse(200,{"x-request-id":"r"},wire,
+        "https://paper-api.alpaca.markets/v2/clock")),environ={
+        "ALPACA_API_KEY_ID":"x","ALPACA_API_SECRET_KEY":"y"})
+    response=client.clock()
+    assert response.provider_timestamp is None and not response.timestamp_available
+    with pytest.raises(ValueError,match="quarantined"): response.require_provider_timestamp()
+
+
+def test_provider_and_oauth_failures_are_sanitized():
+    secret="credential-in-provider-body"
+    client=AlpacaReadOnlyClient(transport=FakeHttp(HttpResponse(500,{},secret.encode(),
+        "https://paper-api.alpaca.markets/v2/clock")),environ={
+        "ALPACA_API_KEY_ID":"x","ALPACA_API_SECRET_KEY":"y"})
+    with pytest.raises(ValueError) as caught: client.clock()
+    assert secret not in str(caught.value)
+    exploding=QueueHttp()
+    def failure(*args,**kwargs): raise RuntimeError(secret)
+    exploding.request=failure
+    client=AlpacaReadOnlyClient(transport=exploding,environ={
+        "ALPACA_API_KEY_ID":secret,"ALPACA_API_SECRET_KEY":secret})
+    with pytest.raises(ExternalServiceError) as caught: client.clock()
+    assert secret not in str(caught.value)
+    oauth=_NoRedirectGoogleAuthRequest(exploding)
+    with pytest.raises(ExternalServiceError) as caught:
+        oauth("https://oauth2.googleapis.com/token",method="POST")
+    assert secret not in str(caught.value)
