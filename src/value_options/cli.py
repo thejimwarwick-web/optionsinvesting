@@ -117,7 +117,9 @@ def main(argv=None):
             sealed_decision=TradingDecision(dpay["decision_id"],dpay["research_id"],_time(dpay["decision_at"]),order,observations,dpay["record_seal"])
             if not sealed_decision.verify(): raise ValueError("decision record seal mismatch")
             run.orders.append(OrderSubmission(p["decision_id"],_time(p["decision_at"]),order,_time(p["submitted_at"])))
-            fill=run.simulate_fill(load_packet(_read(args.quote)),as_of=_time(args.as_of)); artifact=seal_artifact("fill",fill)
+            fill=run.simulate_fill(load_packet(_read(args.quote)),as_of=_time(args.as_of))
+            fill["submission_artifact_id"]=supplied["artifact_id"]
+            artifact=seal_artifact("fill",fill)
         else:
             report=run.excluded_replay(_packets(args.bundle),as_of=_time(args.as_of)); artifact={"mode":"replay",**report.jsonable()}
     except (KeyError,TypeError,ValueError,ArithmeticError) as error:

@@ -62,6 +62,11 @@ class AppendOnlySheetPort(Protocol):
     def read_all(self) -> Iterable[Sequence[str]]: ...
 
 
+class FixtureAttestorPolicy:
+    """Disconnected fixtures can verify content but can never authorize launch."""
+    def trusts(self, receipt: AttestationReceipt) -> bool: return False
+
+
 class SheetAttestationBoundary:
     def __init__(self, port: AppendOnlySheetPort, external_system="google-sheets"):
         self.port, self.external_system = port, external_system
@@ -81,8 +86,10 @@ class SheetAttestationBoundary:
         if actual.row() != record.row() or not actual.verify():
             raise ValueError("sheet read-back does not exactly match append")
         payload = json.loads(actual.payload_json)
-        return AttestationReceipt(record.artifact_id, self.external_system, record.appended_at,
-                                  location, at, record.content_sha256), payload
+        return AttestationReceipt.create(artifact_id=record.artifact_id,
+            external_system=self.external_system, appended_at=record.appended_at,
+            immutable_location=location, read_back_at=at,
+            content_sha256=record.content_sha256, provenance="disconnected-fixture"), payload
 
     def correction(self, bad_record_id: str, corrected_artifact: Mapping[str, Any], at: datetime) -> tuple[SheetRecord, str]:
         if not any(SheetRecord.from_row(row).record_id == bad_record_id for row in self.port.read_all()):
@@ -94,11 +101,14 @@ class SheetAttestationBoundary:
     def reconcile(self, expected: Iterable[SheetRecord]) -> tuple[str, ...]:
         expected_by_id = {x.record_id: x for x in expected}
         actual = [SheetRecord.from_row(x) for x in self.port.read_all()]
-        actual_by_id = {x.record_id: x for x in actual}
+        actual_by_id = {}
+        duplicates = []
+        for row in actual:
+            if row.record_id in actual_by_id: duplicates.append(f"{row.record_id}: duplicate external record ID")
+            else: actual_by_id[row.record_id] = row
         differences = []
         for key in sorted(expected_by_id.keys() | actual_by_id.keys()):
             if key not in actual_by_id: differences.append(f"{key}: missing")
             elif key not in expected_by_id: differences.append(f"{key}: unexpected")
             elif actual_by_id[key].row() != expected_by_id[key].row(): differences.append(f"{key}: mismatch")
-        return tuple(differences)
-
+        return tuple(duplicates + differences)

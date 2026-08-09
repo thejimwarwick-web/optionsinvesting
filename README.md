@@ -65,11 +65,15 @@ expected history, and represents fixes as new correction rows pointing at the ol
 row. It has no update or delete operation. No Google SDK or real spreadsheet ID is
 used by this repository or CI.
 
-An attestation receipt records the artifact ID, external system, append time,
-immutable row location, read-back time, and SHA-256 content hash. A paper artifact
-becomes externally attested only after exact read-back verification. Launch
-eligibility additionally requires every supplied ancestor to already be attested;
-attestation never changes `PAPER ONLY` or `NO LIVE ORDER`.
+An immutable attested envelope retains a deep snapshot of the complete original
+artifact, its local ID and seal, the exact external read-back, a content-addressed
+and sealed receipt, explicit parent IDs, and its own content-addressed ID and seal.
+Verification recursively checks artifact-specific ancestry instead of trusting
+caller-supplied attestation or launch Booleans. Launch eligibility is a verification
+result, not an envelope field, and requires every ancestor plus receipt provenance
+authenticated by an explicitly configured trusted-attestor policy. The disconnected
+fixture policy is never trusted. Attestation never changes `PAPER ONLY` or
+`NO LIVE ORDER`.
 
 The Alpaca port exposes only clock, calendar, underlying quote, option-chain, and
 option-quote reads. Captured evidence retains the untouched response, provider and
