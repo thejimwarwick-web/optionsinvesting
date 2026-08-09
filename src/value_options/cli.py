@@ -26,6 +26,14 @@ def _write(path, value):
     path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps(value, sort_keys=True, indent=2, default=str)+"\n")
 
 
+def _attestation_json(result):
+    record,location,pair,appended=result; receipt,exact=pair
+    body={"record_id":record.record_id,"immutable_location":location,"receipt":receipt.as_json(),
+          "exact_read_back":exact,"appended":appended}
+    return {**body,"envelope_seal":hashlib.sha256(canonical_json(body)).hexdigest(),
+            "launch_eligible":False}
+
+
 def _quarantine(mode, reasons):
     return {"mode":mode,"classification":"PAPER ONLY","order_policy":"NO LIVE ORDER","verified":False,
             "actionable":False,"quarantined":True,"excluded":False,"reasons":list(reasons)}
@@ -77,9 +85,9 @@ def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary
     r=sub.add_parser("research-run"); r.add_argument("input",type=Path); r.add_argument("--at",required=True); r.add_argument("--output",type=Path,required=True)
     rc=sub.add_parser("research-collect"); rc.add_argument("input",type=Path); rc.add_argument("--output",type=Path,required=True); rc.add_argument("--checkpoint",type=Path)
     d=sub.add_parser("decision-run"); d.add_argument("research",type=Path); d.add_argument("bundle",type=Path); d.add_argument("--at",required=True); d.add_argument("--submitted-at",required=True); d.add_argument("--decision-output",type=Path,required=True); d.add_argument("--submission-output",type=Path,required=True)
-    dc=sub.add_parser("decision-collect"); dc.add_argument("research",type=Path); dc.add_argument("proposal",type=Path); dc.add_argument("--decision-output",type=Path,required=True); dc.add_argument("--submission-output",type=Path,required=True); dc.add_argument("--checkpoint",type=Path)
+    dc=sub.add_parser("decision-collect"); dc.add_argument("research",type=Path); dc.add_argument("portfolio",type=Path); dc.add_argument("proposal",type=Path); dc.add_argument("--decision-output",type=Path,required=True); dc.add_argument("--submission-output",type=Path,required=True); dc.add_argument("--checkpoint",type=Path)
     f=sub.add_parser("fill-run"); f.add_argument("decision",type=Path); f.add_argument("submission",type=Path); f.add_argument("quote",type=Path); f.add_argument("--as-of",required=True); f.add_argument("--output",type=Path,required=True)
-    fc=sub.add_parser("fill-collect"); fc.add_argument("research",type=Path); fc.add_argument("decision",type=Path); fc.add_argument("submission",type=Path); fc.add_argument("--output",type=Path,required=True); fc.add_argument("--checkpoint",type=Path)
+    fc=sub.add_parser("fill-collect"); fc.add_argument("research",type=Path); fc.add_argument("portfolio",type=Path); fc.add_argument("decision",type=Path); fc.add_argument("submission",type=Path); fc.add_argument("--output",type=Path,required=True); fc.add_argument("--checkpoint",type=Path)
     rp=sub.add_parser("replay"); rp.add_argument("bundle",type=Path); rp.add_argument("--as-of",required=True); rp.add_argument("--output",type=Path,required=True)
     wr=sub.add_parser("workflow-rehearsal"); wr.add_argument("bundle",type=Path); wr.add_argument("--state",type=Path,required=True); wr.add_argument("--as-of",required=True); wr.add_argument("--output",type=Path,required=True)
     pf=sub.add_parser("preflight"); pf.add_argument("--live-read-only",action="store_true")
@@ -87,11 +95,20 @@ def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary
     args=parser.parse_args(argv); run=_run(); artifact=None
     try:
         if args.command in {"research-collect","decision-collect","fill-collect"}:
-            if collection_providers is None or utc_clock is None:
-                raise ValueError("prospective collection providers and UTC clock are unavailable")
+            if collection_providers is None:
+                from .providers import production_provider_factory
+                collection_providers=production_provider_factory()
+            if utc_clock is None:
+                utc_clock=lambda: datetime.now(timezone.utc)
             from .workflow import (AtomicCheckpoint, decision_collect, fill_collect,
                                    research_collect)
-            checkpoint=AtomicCheckpoint(args.checkpoint) if args.checkpoint else None
+            inputs=[_read(args.input)] if args.command=="research-collect" else (
+                [_read(args.research),_read(args.portfolio),_read(args.proposal)] if args.command=="decision-collect" else
+                [_read(args.research),_read(args.portfolio),_read(args.decision),_read(args.submission)])
+            parent_ids=[x.get("artifact_id") for x in inputs if isinstance(x,dict) and x.get("artifact_id")]
+            bindings={"command_kind":args.command,"canonical_input_hash":hashlib.sha256(canonical_json(inputs)).hexdigest(),
+                "parent_artifact_ids":parent_ids,"mandate_version":DEFAULT_MANDATE.version,"provider_policy_version":"read-only-v1"}
+            checkpoint=AtomicCheckpoint(args.checkpoint,bindings) if args.checkpoint else None
             recovered=checkpoint.read() if checkpoint else {}
             if recovered.get("complete"):
                 artifact=recovered["artifact"]
@@ -99,26 +116,41 @@ def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary
             elif args.command=="research-collect":
                 artifact=research_collect(_read(args.input),collection_providers,utc_clock)
             elif args.command=="decision-collect":
-                decision_artifact,artifact=decision_collect(_read(args.research),_read(args.proposal),collection_providers,utc_clock)
+                decision_artifact,artifact=decision_collect(_read(args.research),_read(args.portfolio),_read(args.proposal),collection_providers,utc_clock)
                 _write(args.decision_output,decision_artifact)
             else:
-                artifact=fill_collect(_read(args.research),_read(args.decision),_read(args.submission),collection_providers,utc_clock)
+                artifact=fill_collect(_read(args.research),_read(args.portfolio),_read(args.decision),_read(args.submission),collection_providers,utc_clock)
             if checkpoint and not recovered.get("complete"):
                 data={"complete":True,"artifact":artifact}
                 if args.command=="decision-collect": data["decision"]=decision_artifact
                 checkpoint.write(data)
+            attestation_evidence=[]
             if sheet_boundary is not None:
                 # The boundary itself requires the independent ledger sentinel.
                 if args.command=="decision-collect":
                     decision_to_append=recovered["decision"] if recovered.get("complete") else decision_artifact
-                    sheet_boundary.append_activated(decision_to_append,utc_clock())
-                sheet_boundary.append_activated(artifact,utc_clock())
+                    attested=sheet_boundary.append_activated(decision_to_append,utc_clock())
+                    attestation_evidence.append(_attestation_json(attested))
+                attested=sheet_boundary.append_activated(artifact,utc_clock())
+                attestation_evidence.append(_attestation_json(attested))
+            if attestation_evidence:
+                artifact={**artifact,"workflow_attestations":attestation_evidence}
+                if checkpoint:
+                    data={"complete":True,"artifact":artifact,"attestations":attestation_evidence}
+                    if args.command=="decision-collect": data["decision"]=decision_to_append
+                    checkpoint.write(data)
             if args.command=="decision-collect": _write(args.submission_output,artifact)
         elif args.command in {"preflight","workflow-preflight"}:
             configured,artifact=preflight()
+            if args.command=="workflow-preflight":
+                from .providers import production_provider_status
+                provider_status=production_provider_status(); artifact["collection_providers"]=provider_status
+                artifact["launch_ready"]=False
             if args.live_read_only:
                 if not configured: raise ValueError("live read-only preflight requires all environment credentials")
                 if not live_read_only_enabled(): raise ValueError("live integration is disabled; set the documented activation environment value")
+                if args.command=="workflow-preflight" and not all(provider_status.values()):
+                    raise ValueError("all read-only collection providers must be configured")
                 # Deliberately harmless reads only: clock and attestation range.
                 from .broker import AlpacaReadOnlyClient
                 from .sheets import GoogleSheetsAdapter, google_service_account_token_provider
@@ -168,6 +200,10 @@ def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary
             artifact=seal_artifact("fill",fill)
         else:
             persisted=_read(args.state) if args.command=="workflow-rehearsal" else None
+            if persisted is not None:
+                from .workflow import portfolio_from_artifact
+                reconstructed=portfolio_from_artifact(persisted)
+                run=PaperRun(DEFAULT_MANDATE,reconstructed)
             persisted_before=hashlib.sha256(canonical_json(persisted)).hexdigest() if persisted is not None else None
             before=run._state_fingerprint()
             report=run.excluded_replay(_packets(args.bundle),as_of=_time(args.as_of))

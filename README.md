@@ -202,8 +202,7 @@ The operator workflow has four deliberately independent authority boundaries:
 4. **Live brokerage is prohibited.** There is no submit, cancel, replace, or live
    order capability. `PAPER ONLY` and `NO LIVE ORDER` remain immutable.
 
-Production connections and appends are off unless their respective exact sentinel
-is present. CI supplies fixtures only, without network, credentials, or Sheet
+Production collection uses the CLI provider factory only after the read-only sentinel is present. It also requires configured `VALUE_OPTIONS_CORPORATE_ACTION_URL`, `VALUE_OPTIONS_DIVIDEND_URL`, and `VALUE_OPTIONS_GBPUSD_URL` HTTPS read-only endpoints; preflight remains launch-unready if any is absent. Connections and appends are off unless their respective exact sentinel is present. CI supplies fixtures only, without network, credentials, or Sheet
 writes. `workflow-rehearsal` is excluded and proves that cash, NAV, orders,
 positions, and launch status retain the same fingerprint.
 
@@ -232,13 +231,13 @@ instead of appending another.
 value-options workflow-preflight                         # configuration only
 value-options workflow-preflight --live-read-only       # activated provider/schema reads
 value-options research-collect research-input.json --output artifacts/research.json --checkpoint state/research.json
-value-options decision-collect artifacts/research.json proposed-operation.json --decision-output artifacts/decision.json --submission-output artifacts/submission.json --checkpoint state/decision.json
-value-options fill-collect artifacts/research.json artifacts/decision.json artifacts/submission.json --output artifacts/fill.json --checkpoint state/fill.json
+value-options decision-collect artifacts/research.json artifacts/portfolio-snapshot.json proposed-operation.json --decision-output artifacts/decision.json --submission-output artifacts/submission.json --checkpoint state/decision.json
+value-options fill-collect artifacts/research.json artifacts/portfolio-snapshot.json artifacts/decision.json artifacts/submission.json --output artifacts/fill.json --checkpoint state/fill.json
 value-options workflow-rehearsal evidence-bundle.json --state fund-state.json --as-of 2026-08-07T13:40:30Z --output artifacts/rehearsal.json
 value-options inspect tests/fixtures/alpaca_opra_quote.json --as-of 2026-08-07T13:40:03Z --output artifacts/inspection.json
 ```
 
-The collect commands enforce research → decision → submission → fill ancestry.
+The collect commands enforce research → externally reconciled portfolio snapshot → decision → submission → fill ancestry. Portfolio snapshots reconstruct actual cash, NAV, peak NAV/drawdown, holdings, option shorts and marks, so existing CSP collateral, covered calls, and issuer/sector usage enter the authoritative risk calculation.
 Research accepts only underlying/thesis pairs; prospective code obtains clock,
 calendar, and every underlying quote through injected read-only provider ports. Decision uses fresh complete evidence, OPRA contract data, and
 explicit corporate-action, dividend, and GBP/USD provider ports, and the

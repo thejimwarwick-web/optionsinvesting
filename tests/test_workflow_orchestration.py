@@ -5,8 +5,11 @@ import pytest
 
 from value_options.cli import main
 from value_options.operations import seal_artifact
+from value_options.market_data import EvidenceKind, canonical_json
+import hashlib
 from value_options.sheets import GoogleSheetsAdapter, HEADERS, SheetAttestationBoundary
 from value_options.workflow import ReadResult
+from value_options.workflow import AtomicCheckpoint, collect_packet
 
 UTC=timezone.utc; CONTRACT='AAPL260828P00020000'
 
@@ -41,7 +44,13 @@ class MemorySheet:
         return self.rows[int(re.search(r'!A(\d+):',location).group(1))-2]
 
 def write(path,value): path.write_text(json.dumps(value))
-def proposal(): return {'operation':{'order_id':'paper-1','side':'sell','quantity':1,'intent':'open','instrument':{'symbol':CONTRACT,'issuer':'Apple','sector':'Technology','underlying':'AAPL','expiration':'2026-08-28','strike':'20','right':'put'}}}
+def proposal(): return {'operation':{'order_id':'paper-1','side':'sell','quantity':1,'intent':'open','exit_entire_holding':False,'sale_floor':None,'instrument':{'symbol':CONTRACT,'asset_type':'option','issuer':'Apple','sector':'Technology','market':'US','currency':'USD','is_etf':False,'underlying':'AAPL','expiration':'2026-08-28','strike':'20','right':'put','multiplier':100,'adjusted':False,'occ_verified':True}}}
+
+
+def portfolio_artifact():
+    payload={'nav_gbp':'100000','peak_nav_gbp':'100000','cash_gbp':'100000','positions':[],'externally_reconciled':True}
+    payload['reconciliation_seal']=hashlib.sha256(canonical_json(payload)).hexdigest()
+    return seal_artifact('portfolio_snapshot',payload)
 
 def collect_research(tmp_path,clock,providers):
     source=tmp_path/'candidates.json'; out=tmp_path/'research.json'; write(source,{'candidates':[{'underlying':'AAPL','thesis':'value'}]})
@@ -67,29 +76,29 @@ def test_collect_rejects_caller_timestamps(tmp_path):
 
 def test_prospective_decision_submission_and_fresh_fill(tmp_path):
     rclock=TickClock(datetime(2026,8,7,12,30,tzinfo=UTC)); research=collect_research(tmp_path,rclock,Providers(rclock))
-    clock=TickClock(datetime(2026,8,7,13,40,tzinfo=UTC)); providers=Providers(clock); prop=tmp_path/'proposal.json'; write(prop,proposal())
+    clock=TickClock(datetime(2026,8,7,13,40,tzinfo=UTC)); providers=Providers(clock); prop=tmp_path/'proposal.json'; write(prop,proposal()); portfolio=tmp_path/'portfolio.json'; write(portfolio,portfolio_artifact())
     decision,submission=tmp_path/'decision.json',tmp_path/'submission.json'
-    assert main(['decision-collect',str(research),str(prop),'--decision-output',str(decision),'--submission-output',str(submission)],collection_providers=providers,utc_clock=clock)==0
+    assert main(['decision-collect',str(research),str(portfolio),str(prop),'--decision-output',str(decision),'--submission-output',str(submission)],collection_providers=providers,utc_clock=clock)==0
     assert {'corporate_action','dividend','fx'} <= set(providers.calls)
     sub=json.loads(submission.read_text()); assert sub['payload']['submitted_at']>sub['payload']['decision_at']
     fill=tmp_path/'fill.json'
-    assert main(['fill-collect',str(research),str(decision),str(submission),'--output',str(fill)],collection_providers=providers,utc_clock=clock)==0
+    assert main(['fill-collect',str(research),str(portfolio),str(decision),str(submission),'--output',str(fill)],collection_providers=providers,utc_clock=clock)==0
     result=json.loads(fill.read_text())['payload']; assert result['price']=='1' and result['response_received_at']>sub['payload']['submitted_at']
 
 @pytest.mark.parametrize('missing',[{'corporate_action'},{'dividend'},{'fx'}])
 def test_missing_auxiliary_provider_quarantines(tmp_path,missing):
     rc=TickClock(datetime(2026,8,7,12,30,tzinfo=UTC)); research=collect_research(tmp_path,rc,Providers(rc))
-    clock=TickClock(datetime(2026,8,7,13,40,tzinfo=UTC)); prop=tmp_path/'p.json'; write(prop,proposal()); d,s=tmp_path/'d',tmp_path/'s'
-    assert main(['decision-collect',str(research),str(prop),'--decision-output',str(d),'--submission-output',str(s)],collection_providers=Providers(clock,missing),utc_clock=clock)==1
+    clock=TickClock(datetime(2026,8,7,13,40,tzinfo=UTC)); prop=tmp_path/'p.json'; write(prop,proposal()); portfolio=tmp_path/'portfolio.json'; write(portfolio,portfolio_artifact()); d,s=tmp_path/'d',tmp_path/'s'
+    assert main(['decision-collect',str(research),str(portfolio),str(prop),'--decision-output',str(d),'--submission-output',str(s)],collection_providers=Providers(clock,missing),utc_clock=clock)==1
 
 def test_stale_fill_and_ancestry_substitution_rejected(tmp_path):
     rc=TickClock(datetime(2026,8,7,12,30,tzinfo=UTC)); research=collect_research(tmp_path,rc,Providers(rc))
-    clock=TickClock(datetime(2026,8,7,13,40,tzinfo=UTC)); p=tmp_path/'p'; write(p,proposal()); d,s=tmp_path/'d',tmp_path/'s'
-    main(['decision-collect',str(research),str(p),'--decision-output',str(d),'--submission-output',str(s)],collection_providers=Providers(clock),utc_clock=clock)
+    clock=TickClock(datetime(2026,8,7,13,40,tzinfo=UTC)); p=tmp_path/'p'; write(p,proposal()); portfolio=tmp_path/'portfolio'; write(portfolio,portfolio_artifact()); d,s=tmp_path/'d',tmp_path/'s'
+    main(['decision-collect',str(research),str(portfolio),str(p),'--decision-output',str(d),'--submission-output',str(s)],collection_providers=Providers(clock),utc_clock=clock)
     providers=Providers(clock); providers.stale=True; out=tmp_path/'fill'
-    assert main(['fill-collect',str(research),str(d),str(s),'--output',str(out)],collection_providers=providers,utc_clock=clock)==1
+    assert main(['fill-collect',str(research),str(portfolio),str(d),str(s),'--output',str(out)],collection_providers=providers,utc_clock=clock)==1
     forged=seal_artifact('research',{'research_id':'other'}); other=tmp_path/'other'; write(other,forged)
-    assert main(['fill-collect',str(other),str(d),str(s),'--output',str(out)],collection_providers=Providers(clock),utc_clock=clock)==1
+    assert main(['fill-collect',str(other),str(portfolio),str(d),str(s),'--output',str(out)],collection_providers=Providers(clock),utc_clock=clock)==1
 
 def test_sheet_recovery_after_external_write_without_duplicate():
     port=MemorySheet(); boundary=SheetAttestationBoundary(port); artifact=seal_artifact('research',{'research_id':'x'}); at=datetime(2026,8,7,12,30,tzinfo=UTC); env={'VALUE_OPTIONS_ENABLE_PAPER_LEDGER_APPEND':'I_AUTHORIZE_APPEND_ONLY_PAPER_LEDGER'}
@@ -102,7 +111,7 @@ def test_sheet_recovery_after_external_write_without_duplicate():
 def test_sheet_preflight_exact_and_rehearsal_nonempty_state(tmp_path):
     adapter=object.__new__(GoogleSheetsAdapter); adapter._spreadsheet,adapter._range='expected','Attestations!A:G'; adapter._request=lambda *a,**k:{'values':[list(HEADERS)]}
     assert adapter.preflight('expected')['writes']==0
-    state={'cash':'90000','nav':'101000','launch_status':'PAPER ONLY','orders':['x'],'positions':{'AAPL':3}}
+    state=portfolio_artifact()
     snapshot=tmp_path/'state.json'; bundle=tmp_path/'bundle.json'; out=tmp_path/'out.json'; write(snapshot,state); write(bundle,{'packets':[]})
     assert main(['workflow-rehearsal',str(bundle),'--state',str(snapshot),'--as-of','2026-08-07T13:40:00Z','--output',str(out)])==0
     assert json.loads(out.read_text())['persisted_state_unchanged']
@@ -122,3 +131,13 @@ def test_checkpoint_repeat_is_idempotent_and_subprocess_quarantines(tmp_path):
         str(source),'--output',str(isolated)],cwd=Path(__file__).parents[1],
         env={**os.environ,'PYTHONPATH':'src'},capture_output=True,text=True)
     assert result.returncode!=0 and json.loads(isolated.read_text())['quarantined']
+
+
+def test_checkpoint_binding_tamper_and_observation_after_receipt_are_rejected(tmp_path):
+    path=tmp_path/'checkpoint.json'; checkpoint=AtomicCheckpoint(path,{'command_kind':'research','canonical_input_hash':'a'})
+    checkpoint.write({'complete':True}); value=json.loads(path.read_text()); value['value']['complete']=False; write(path,value)
+    with pytest.raises(ValueError,match='checkpoint'): checkpoint.read()
+    clock=TickClock(datetime(2026,8,7,12,30,tzinfo=UTC))
+    def future(): return ReadResult('fixture','fixture',{}, {'timestamp':(clock.value+timedelta(minutes=1)).isoformat()})
+    with pytest.raises(ValueError,match='after response receipt'):
+        collect_packet(EvidenceKind.CLOCK,future,clock,{})

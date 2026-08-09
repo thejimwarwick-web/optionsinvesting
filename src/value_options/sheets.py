@@ -222,8 +222,9 @@ class FixtureAttestorPolicy:
 
 
 class SheetAttestationBoundary:
-    def __init__(self, port: AppendOnlySheetPort, external_system="google-sheets"):
-        self.port, self.external_system = port, external_system
+    def __init__(self, port: AppendOnlySheetPort, external_system="google-sheets",
+                 provenance="disconnected-fixture"):
+        self.port, self.external_system, self.provenance = port, external_system, provenance
 
     def append(self, artifact: Mapping[str, Any], at: datetime) -> tuple[SheetRecord, str, bool]:
         record = SheetRecord.create(artifact, at)
@@ -253,7 +254,7 @@ class SheetAttestationBoundary:
         return AttestationReceipt.create(artifact_id=record.artifact_id,
             external_system=self.external_system, appended_at=record.appended_at,
             immutable_location=location, read_back_at=at,
-            content_sha256=record.content_sha256, provenance="disconnected-fixture"), payload
+            content_sha256=record.content_sha256, provenance=self.provenance), payload
 
     def correction(self, bad_record_id: str, corrected_artifact: Mapping[str, Any], at: datetime) -> tuple[SheetRecord, str]:
         if not any(SheetRecord.from_row(row).record_id == bad_record_id for row in self.port.read_all()):

@@ -3,12 +3,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-import hashlib, json, os, tempfile
+import fcntl, hashlib, json, os, tempfile
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
 from .mandate import DEFAULT_MANDATE
 from .market_data import EvidenceKind, EvidencePacket, assess, canonical_json, ingest_response
+from .accounting import Position
 from .models import AssetType, Instrument, Observation, OptionRight, Order, OrderSubmission, ResearchCandidate, Side, TradingDecision
 from .operations import PaperRun, seal_artifact, verify_artifact
 from .risk import PortfolioRisk
@@ -30,17 +31,27 @@ class CollectionProviders(Protocol):
     def fx(self,pair:str)->ReadResult: ...
 
 class AtomicCheckpoint:
-    def __init__(self,path:Path): self.path=path
-    def read(self): return json.loads(self.path.read_text()) if self.path.exists() else {}
+    def __init__(self,path:Path,bindings=None): self.path=path; self.bindings=dict(bindings or {})
+    def _seal(self,value):
+        body={'bindings':self.bindings,'value':value}; checkpoint_id=hashlib.sha256(canonical_json(body)).hexdigest()
+        return {'checkpoint_id':checkpoint_id,**body,'seal':hashlib.sha256(canonical_json({'checkpoint_id':checkpoint_id,**body})).hexdigest()}
+    def read(self):
+        if not self.path.exists(): return {}
+        envelope=json.loads(self.path.read_text()); expected=self._seal(envelope.get('value'))
+        if envelope!=expected: raise ValueError('checkpoint seal or bound inputs mismatch')
+        return envelope['value']
     def write(self,value):
         self.path.parent.mkdir(parents=True,exist_ok=True)
-        fd,name=tempfile.mkstemp(dir=self.path.parent,prefix=self.path.name+'.')
-        try:
-            with os.fdopen(fd,'w') as f:
-                f.write(json.dumps(value,sort_keys=True,indent=2)+'\n'); f.flush(); os.fsync(f.fileno())
-            os.replace(name,self.path)
-        finally:
-            if os.path.exists(name): os.unlink(name)
+        lock_path=self.path.with_suffix(self.path.suffix+'.lock')
+        with lock_path.open('a+') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX); fd,name=tempfile.mkstemp(dir=self.path.parent,prefix=self.path.name+'.')
+            try:
+                with os.fdopen(fd,'w') as f:
+                    f.write(json.dumps(self._seal(value),sort_keys=True,indent=2)+'\n'); f.flush(); os.fsync(f.fileno())
+                os.replace(name,self.path)
+                directory=os.open(self.path.parent,os.O_RDONLY); os.fsync(directory); os.close(directory)
+            finally:
+                if os.path.exists(name): os.unlink(name)
 
 def _now(clock):
     value=clock()
@@ -52,10 +63,13 @@ def collect_packet(kind,call,clock,request):
     if not isinstance(result,ReadResult): raise ValueError(f'{kind.value} provider returned malformed response')
     n=dict(result.normalized)
     if not isinstance(n.get('timestamp'),str): raise ValueError(f'{kind.value} provider observation timestamp unavailable')
+    try: observed=_time(n['timestamp'])
+    except (TypeError,ValueError): raise ValueError(f'{kind.value} provider observation timestamp malformed') from None
+    if observed>received: raise ValueError(f'{kind.value} provider observation is after response receipt')
     packet=ingest_response(kind=kind,provider=result.provider,feed=result.feed,request={**request,'request_started_at':started.isoformat()},requested_at=started,received_at=received,raw=result.raw,normalized=n)
     return packet
 
-def _run(): return PaperRun(DEFAULT_MANDATE,PortfolioRisk(Decimal('100000'),Decimal('100000'),Decimal('100000'),{},{}))
+def _run(portfolio=None): return PaperRun(DEFAULT_MANDATE,portfolio or PortfolioRisk(Decimal('100000'),Decimal('100000'),Decimal('100000'),{},{}))
 def _time(x): return datetime.fromisoformat(x).astimezone(timezone.utc)
 def _research(value):
     ok,reasons=verify_artifact(value,'research')
@@ -67,7 +81,29 @@ def _research(value):
     if not record.verify(): raise ValueError('research record seal mismatch')
     return record
 
-def _instrument(s): return Instrument(s['symbol'],AssetType.OPTION,s['issuer'],s['sector'],'US',underlying=s['underlying'],expiry=datetime.fromisoformat(s['expiration']).date(),strike=Decimal(s['strike']),right=OptionRight(s['right']),multiplier=100)
+INSTRUMENT_FIELDS={'symbol','asset_type','issuer','sector','market','currency','is_etf','underlying','expiration','strike','right','multiplier','adjusted','occ_verified'}
+ORDER_FIELDS={'order_id','instrument','side','quantity','intent','exit_entire_holding','sale_floor'}
+def _instrument(s):
+    if set(s)!=INSTRUMENT_FIELDS: raise ValueError('instrument proposal fields must be exact')
+    asset=AssetType(s['asset_type'])
+    if asset is AssetType.OPTION and s['currency']!='USD': raise ValueError('options require USD currency')
+    return Instrument(s['symbol'],asset,s['issuer'],s['sector'],s['market'],is_etf=bool(s['is_etf']),underlying=s['underlying'],expiry=datetime.fromisoformat(s['expiration']).date() if s['expiration'] else None,strike=Decimal(s['strike']) if s['strike'] is not None else None,right=OptionRight(s['right']) if s['right'] else None,multiplier=int(s['multiplier']),adjusted=bool(s['adjusted']),occ_verified=bool(s['occ_verified']))
+def _order(op,instrument):
+    if set(op)!=ORDER_FIELDS: raise ValueError('operation proposal fields must be exact')
+    return Order(op['order_id'],instrument,Side(op['side']),int(op['quantity']),op['intent'],bool(op['exit_entire_holding']),Decimal(op['sale_floor']) if op['sale_floor'] is not None else None)
+
+def portfolio_from_artifact(artifact):
+    ok,reasons=verify_artifact(artifact,'portfolio_snapshot')
+    if not ok: raise ValueError('; '.join(reasons))
+    p=artifact['payload']
+    if p.get('externally_reconciled') is not True or not p.get('reconciliation_seal'):
+        raise ValueError('externally reconciled portfolio snapshot required')
+    body={k:v for k,v in p.items() if k!='reconciliation_seal'}
+    if p['reconciliation_seal']!=hashlib.sha256(canonical_json(body)).hexdigest(): raise ValueError('portfolio reconciliation seal mismatch')
+    positions={}; marks={}
+    for row in p.get('positions',[]):
+        instrument=_instrument(row['instrument']); positions[instrument]=Position(instrument,int(row['quantity']),Decimal(row.get('cost_basis_gbp','0'))); marks[instrument]=Decimal(row['mark_gbp'])
+    return PortfolioRisk(Decimal(p['nav_gbp']),Decimal(p['peak_nav_gbp']),Decimal(p['cash_gbp']),positions,marks)
 def _evidence_refs(packets): return [{'name':p.kind.value,'value':p.packet_id,'available_at':p.received_at.isoformat(),'request_started_at':p.requested_at.isoformat(),'provider_observed_at':p.normalized['timestamp']} for p in packets]
 
 def research_collect(source,providers,clock):
@@ -86,8 +122,9 @@ def research_collect(source,providers,clock):
     payload={'research_id':record.packet_id,'mandate_version':record.mandate_version,'research_at':at.isoformat(),'candidates':[asdict(x) for x in candidates],'evidence_references':_evidence_refs(packets),'evidence_packets':[p.as_json() for p in packets],'rationale':record.rationale,'record_seal':record.seal}
     return seal_artifact('research',payload)
 
-def decision_collect(research_artifact,proposal,providers,clock):
+def decision_collect(research_artifact,portfolio_artifact,proposal,providers,clock):
     research=_research(research_artifact); op=proposal['operation']; instrument=_instrument(op['instrument'])
+    portfolio=portfolio_from_artifact(portfolio_artifact)
     if instrument.underlying not in {x.underlying for x in research.shortlist}: raise ValueError('underlying absent from research shortlist')
     day=_now(clock).date().isoformat(); calls=[
       (EvidenceKind.CLOCK,providers.clock,{}),(EvidenceKind.CALENDAR,lambda:providers.calendar(day,day),{'start':day,'end':day}),
@@ -98,25 +135,28 @@ def decision_collect(research_artifact,proposal,providers,clock):
       (EvidenceKind.DIVIDEND,lambda:providers.dividend(instrument.underlying),{'underlying':instrument.underlying}),
       (EvidenceKind.FX,lambda:providers.fx('GBPUSD'),{'pair':'GBPUSD'})]
     packets=[collect_packet(k,c,clock,r) for k,c,r in calls]
-    decision_at=_now(clock); run=_run(); run.research_packet=research
-    order=Order(op['order_id'],instrument,Side(op['side']),int(op['quantity']),op['intent'])
+    decision_at=_now(clock); run=_run(portfolio); run.research_packet=research
+    order=_order(op,instrument)
     decision=run.decide(decision_at,order,packets)
     rules=asdict(run.rule_results); rules['evaluated_at']=run.rule_results.evaluated_at.isoformat()
-    dp={'decision_id':decision.decision_id,'research_id':research.packet_id,'research_artifact_id':research_artifact['artifact_id'],'decision_at':decision_at.isoformat(),'order':op,'record_seal':decision.seal,'rule_results':rules,'evidence_references':_evidence_refs(packets),'evidence_packet_ids':[p.packet_id for p in packets]}
+    dp={'decision_id':decision.decision_id,'research_id':research.packet_id,'research_artifact_id':research_artifact['artifact_id'],'portfolio_snapshot_artifact_id':portfolio_artifact['artifact_id'],'decision_at':decision_at.isoformat(),'order':op,'record_seal':decision.seal,'rule_results':rules,'evidence_references':_evidence_refs(packets),'evidence_packet_ids':[p.packet_id for p in packets]}
     da=seal_artifact('decision',dp); submitted_at=_now(clock); submission=run.submit(submitted_at)
-    sp={'decision_artifact_id':da['artifact_id'],'decision_id':decision.decision_id,'decision_at':decision_at.isoformat(),'submitted_at':submission.submitted_at.isoformat(),'order':op,'rule_results_seal':rules['seal'],'evidence_packet_ids':[p.packet_id for p in packets]}
+    ledger_event={'event_id':'submission:'+decision.decision_id,'kind':'paper_submission','occurred_at':submission.submitted_at.isoformat(),'applied':False,'requires_launch_authorization':True}
+    sp={'decision_artifact_id':da['artifact_id'],'decision_id':decision.decision_id,'decision_at':decision_at.isoformat(),'submitted_at':submission.submitted_at.isoformat(),'order':op,'rule_results_seal':rules['seal'],'evidence_packet_ids':[p.packet_id for p in packets],'paper_ledger_event':ledger_event}
     return da,seal_artifact('submission',sp)
 
-def fill_collect(research_artifact,decision_artifact,submission_artifact,providers,clock):
+def fill_collect(research_artifact,portfolio_artifact,decision_artifact,submission_artifact,providers,clock):
     research=_research(research_artifact); dok,dr=verify_artifact(decision_artifact,'decision'); sok,sr=verify_artifact(submission_artifact,'submission')
     if not dok or not sok: raise ValueError('; '.join(dr+sr))
     d,s=decision_artifact['payload'],submission_artifact['payload']
     if d.get('research_artifact_id')!=research_artifact['artifact_id'] or d.get('research_id')!=research.packet_id: raise ValueError('research ancestry substitution')
+    portfolio=portfolio_from_artifact(portfolio_artifact)
+    if d.get('portfolio_snapshot_artifact_id')!=portfolio_artifact['artifact_id']: raise ValueError('portfolio ancestry substitution')
     if s.get('decision_artifact_id')!=decision_artifact['artifact_id'] or s.get('decision_id')!=d.get('decision_id'): raise ValueError('decision ancestry substitution')
     if canonical_json(s.get('order'))!=canonical_json(d.get('order')): raise ValueError('submission order differs from decision')
     if s.get('decision_at')!=d.get('decision_at') or _time(s['submitted_at'])<=_time(d['decision_at']): raise ValueError('decision/submission chronology invalid')
     if s.get('rule_results_seal')!=d.get('rule_results',{}).get('seal'): raise ValueError('rule-results ancestry substitution')
     op=s['order']; instrument=_instrument(op['instrument']); packet=collect_packet(EvidenceKind.OPTION_QUOTE,lambda:providers.option_quote(instrument.symbol),clock,{'symbol':instrument.symbol})
-    run=_run(); order=Order(op['order_id'],instrument,Side(op['side']),int(op['quantity']),op['intent']); run.orders.append(OrderSubmission(s['decision_id'],_time(s['decision_at']),order,_time(s['submitted_at'])))
-    filled_at=_now(clock); fill=run.simulate_fill(packet,as_of=filled_at); fill.update(submission_artifact_id=submission_artifact['artifact_id'],research_artifact_id=research_artifact['artifact_id'],request_started_at=packet.requested_at.isoformat(),provider_observed_at=packet.normalized['timestamp'],response_received_at=packet.received_at.isoformat())
+    run=_run(portfolio); order=_order(op,instrument); run.orders.append(OrderSubmission(s['decision_id'],_time(s['decision_at']),order,_time(s['submitted_at'])))
+    filled_at=_now(clock); fill=run.simulate_fill(packet,as_of=filled_at); fill.update(submission_artifact_id=submission_artifact['artifact_id'],research_artifact_id=research_artifact['artifact_id'],portfolio_snapshot_artifact_id=portfolio_artifact['artifact_id'],request_started_at=packet.requested_at.isoformat(),provider_observed_at=packet.normalized['timestamp'],response_received_at=packet.received_at.isoformat(),paper_ledger_event={'event_id':'fill:'+s['decision_id']+':'+packet.packet_id,'kind':'paper_fill','occurred_at':filled_at.isoformat(),'applied':False,'requires_launch_authorization':True})
     return seal_artifact('fill',fill)
