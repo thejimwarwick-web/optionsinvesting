@@ -145,6 +145,18 @@ class GoogleSheetsAdapter:
         if rows and tuple(rows[0]) == HEADERS: rows.pop(0)
         return tuple(tuple(row) for row in rows)
 
+    def preflight(self, expected_spreadsheet_id: str) -> Mapping[str, Any]:
+        """Verify identity, tab and exact schema using one non-mutating Values GET."""
+        if expected_spreadsheet_id != self._spreadsheet:
+            raise ValueError("spreadsheet identity mismatch")
+        if self._range != "Attestations!A:G":
+            raise ValueError("attestation tab or range mismatch")
+        rows = self._values(self._request("GET", "", value_range="Attestations!A1:G1"))
+        if len(rows) != 1 or tuple(self._provider_row(rows[0])) != HEADERS:
+            raise ValueError("attestation header must be the exact seven-column schema")
+        return {"spreadsheet_id": self._spreadsheet, "tab": "Attestations",
+                "header": list(HEADERS), "writes": 0, "verified": True}
+
     @staticmethod
     def _values(result):
         rows = result.get("values", [])
@@ -221,6 +233,19 @@ class SheetAttestationBoundary:
                 if existing.row() != record.row(): raise ValueError("duplicate record ID has different content")
                 return existing, f"record:{existing.record_id}", False
         return record, self.port.append_row(record.row()), True
+
+    def append_activated(self, artifact: Mapping[str, Any], at: datetime, *, environ=None):
+        """Append only with the dedicated paper-ledger sentinel, then exact read-back."""
+        from .config import paper_ledger_enabled
+        if not paper_ledger_enabled(environ):
+            raise ValueError("paper-ledger append is disabled")
+        record, location, appended = self.append(artifact, at)
+        # Recovery of an already-present record uses its stable synthetic location;
+        # no second write is attempted. Callers retain the original receipt.
+        if not appended:
+            return record, location, None, False
+        receipt, exact = self.read_back(record, location, at)
+        return record, location, (receipt, exact), True
 
     def read_back(self, record: SheetRecord, location: str, at: datetime) -> tuple[AttestationReceipt, Mapping[str, Any]]:
         require_utc(at, "read_back_at")

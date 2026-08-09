@@ -182,6 +182,29 @@ out-of-coverage, unverified, or seal-invalid evidence quarantines the event.
   NAV, orders, or positions. Taxes, fees, and slippage beyond adverse-side fills
   are not accrued.
 
+## Paper workflow orchestration (disabled by default)
+
+The operator workflow has four deliberately independent authority boundaries:
+
+1. **Read-only network activation** uses
+   `VALUE_OPTIONS_ENABLE_LIVE_READ_ONLY=I_UNDERSTAND_READ_ONLY_NETWORK_ACCESS`.
+   It permits only the allowlisted evidence GETs and never permits Sheet appends.
+2. **Paper-ledger append activation** separately uses
+   `VALUE_OPTIONS_ENABLE_PAPER_LEDGER_APPEND=I_AUTHORIZE_APPEND_ONLY_PAPER_LEDGER`.
+   Before an append, `workflow-preflight` verifies spreadsheet identity, the
+   `Attestations` tab, and its exact seven-column header. Every actual append is
+   followed by an exact-range GET and immutable envelope; rows are never updated
+   or deleted.
+3. **Paper-fund launch authorization** remains a separate verified launch
+   workflow. Neither sentinel, an artifact, rehearsal, nor receipt changes it.
+4. **Live brokerage is prohibited.** There is no submit, cancel, replace, or live
+   order capability. `PAPER ONLY` and `NO LIVE ORDER` remain immutable.
+
+Production connections and appends are off unless their respective exact sentinel
+is present. CI supplies fixtures only, without network, credentials, or Sheet
+writes. `workflow-rehearsal` is excluded and proves that cash, NAV, orders,
+positions, and launch status retain the same fingerprint.
+
 ## Offline sequential operational runs
 
 The operational path is deliberately three separate invocations. `research-run`
@@ -195,12 +218,20 @@ ambiguous. Missing or malformed input produces a structured quarantine artifact.
 state-neutral test convenience. Every output says `PAPER ONLY` and `NO LIVE ORDER`:
 
 ```bash
-value-options research-run research-input.json --at 2026-08-07T12:33:00Z --output artifacts/research.json
-value-options decision-run artifacts/research.json decision-evidence.json --at 2026-08-07T13:42:00Z --submitted-at 2026-08-07T13:42:01Z --decision-output artifacts/decision.json --submission-output artifacts/submission.json
-value-options fill-run artifacts/decision.json artifacts/submission.json post-submission-option-quote.json --as-of 2026-08-07T13:42:05Z --output artifacts/fill.json
-value-options replay evidence-bundle.json --as-of 2026-08-07T13:40:30Z --output artifacts/replay.json
+value-options workflow-preflight
+value-options research-collect research-input.json --at 2026-08-07T12:33:00Z --output artifacts/research.json
+value-options decision-collect artifacts/research.json decision-evidence.json --at 2026-08-07T13:42:00Z --submitted-at 2026-08-07T13:42:01Z --decision-output artifacts/decision.json --submission-output artifacts/submission.json
+value-options fill-collect artifacts/research.json artifacts/decision.json artifacts/submission.json post-submission-option-quote.json --as-of 2026-08-07T13:42:05Z --output artifacts/fill.json
+value-options workflow-rehearsal evidence-bundle.json --as-of 2026-08-07T13:40:30Z --output artifacts/rehearsal.json
 value-options inspect tests/fixtures/alpaca_opra_quote.json --as-of 2026-08-07T13:40:03Z --output artifacts/inspection.json
 ```
+
+The collect commands enforce research → decision → submission → fill ancestry.
+Research accepts only underlying/thesis pairs and clock, calendar, and underlying
+quote references. Decision uses fresh complete evidence, OPRA contract data, and
+the mandate/risk engine, then seals decision separately before simulated
+submission. Fill re-verifies all ancestors and requires a new exact-contract OPRA
+quote observed and received after submission; buys use ask and sells use bid.
 
 Operational commands exit non-zero whenever a research, decision, submission, or
 fill stage is quarantined, invalid, or non-actionable, so schedulers cannot mistake

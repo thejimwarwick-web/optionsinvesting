@@ -7,6 +7,7 @@ from typing import Mapping
 REQUIRED_ENV = ("ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY",
                 "GOOGLE_SHEETS_SPREADSHEET_ID", "GOOGLE_SERVICE_ACCOUNT_JSON")
 LIVE_ENABLE_ENV = "VALUE_OPTIONS_ENABLE_LIVE_READ_ONLY"
+LEDGER_ENABLE_ENV = "VALUE_OPTIONS_ENABLE_PAPER_LEDGER_APPEND"
 _SECRET_NAME = re.compile(r"(secret|token|password|credential|api.?key|service_account)", re.I)
 
 
@@ -42,3 +43,9 @@ def preflight(environ: Mapping[str, str] | None = None) -> tuple[bool, dict]:
 def live_read_only_enabled(environ: Mapping[str, str] | None = None) -> bool:
     values = os.environ if environ is None else environ
     return values.get(LIVE_ENABLE_ENV) == "I_UNDERSTAND_READ_ONLY_NETWORK_ACCESS"
+
+
+def paper_ledger_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    """A separate capability switch; network-read activation never implies writes."""
+    values = os.environ if environ is None else environ
+    return values.get(LEDGER_ENABLE_ENV) == "I_AUTHORIZE_APPEND_ONLY_PAPER_LEDGER"
