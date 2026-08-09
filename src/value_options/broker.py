@@ -100,7 +100,23 @@ class AlpacaReadOnlyClient:
     def clock(self): return self._get(self.TRADING_HOST, "/v2/clock", {}, "clock", "alpaca-trading")
     def calendar(self, start, end): return self._get(self.TRADING_HOST, "/v2/calendar", {"start": start, "end": end}, "calendar", "alpaca-trading")
     def underlying_quote(self, symbol): return self._get(self.DATA_HOST, f"/v2/stocks/{_symbol(symbol)}/quotes/latest", {"feed": "iex"}, "underlying_quote", "iex")
-    def option_chain(self, underlying): return self._get(self.DATA_HOST, f"/v1beta1/options/snapshots/{_symbol(underlying)}", {"feed": "opra"}, "option_chain", "opra")
+    def option_chain(self, underlying):
+        symbol=_symbol(underlying); pages=[]; token=None
+        while True:
+            query={"feed":"opra"}
+            if token: query["page_token"]=token
+            response=self._get(self.DATA_HOST,f"/v1beta1/options/snapshots/{symbol}",query,"option_chain","opra")
+            page=response.raw; pages.append({"raw":page,"raw_response_hex":response.raw_response.hex(),
+                "request_id":response.request_id,"provider_timestamp":response.provider_timestamp.isoformat() if response.provider_timestamp else None,
+                "received_at":response.received_at.isoformat(),"raw_sha256":response.raw_sha256})
+            next_token=page.get("next_page_token")
+            if not next_token: break
+            if not isinstance(next_token,str) or next_token in {x["raw"].get("next_page_token") for x in pages[:-1]}:
+                raise ValueError("invalid or repeated option-chain page token")
+            token=next_token
+        combined={"pages":pages,"snapshots":{k:v for page in pages for k,v in page["raw"]["snapshots"].items()}}
+        return ProviderResponse.capture("option_chain",response.request_id,"opra",response.provider_timestamp,
+            response.received_at,combined)
     def option_quote(self, symbol): return self._get(self.DATA_HOST, "/v1beta1/options/quotes/latest", {"symbols": _symbol(symbol), "feed": "opra"}, "option_quote", "opra")
 
 

@@ -6,6 +6,7 @@ from datetime import datetime
 import hashlib
 import json
 import os
+import threading
 from urllib.parse import quote, urlencode, urlsplit
 from typing import Any, Iterable, Mapping, Protocol, Sequence
 
@@ -145,6 +146,18 @@ class GoogleSheetsAdapter:
         if rows and tuple(rows[0]) == HEADERS: rows.pop(0)
         return tuple(tuple(row) for row in rows)
 
+    def preflight(self, expected_spreadsheet_id: str) -> Mapping[str, Any]:
+        """Verify identity, tab and exact schema using one non-mutating Values GET."""
+        if expected_spreadsheet_id != self._spreadsheet:
+            raise ValueError("spreadsheet identity mismatch")
+        if self._range != "Attestations!A:G":
+            raise ValueError("attestation tab or range mismatch")
+        rows = self._values(self._request("GET", "", value_range="Attestations!A1:G1"))
+        if len(rows) != 1 or tuple(self._provider_row(rows[0])) != HEADERS:
+            raise ValueError("attestation header must be the exact seven-column schema")
+        return {"spreadsheet_id": self._spreadsheet, "tab": "Attestations",
+                "header": list(HEADERS), "writes": 0, "verified": True}
+
     @staticmethod
     def _values(result):
         rows = result.get("values", [])
@@ -209,18 +222,81 @@ class FixtureAttestorPolicy:
     def trusts(self, receipt: AttestationReceipt) -> bool: return False
 
 
+class ProductionSheetAttestorPolicy:
+    """Authenticate provenance by independently reading the configured immutable row."""
+    def __init__(self, adapter: GoogleSheetsAdapter, spreadsheet_id: str):
+        self.adapter,self.external_system=adapter,"google-sheets:"+spreadsheet_id
+    def trusts(self, receipt: AttestationReceipt) -> bool:
+        if receipt.provenance!="authenticated-production" or receipt.external_system!=self.external_system:
+            return False
+        if not re.fullmatch(r"(?:'Attestations'|Attestations)!A([2-9][0-9]*):G\1",receipt.immutable_location):
+            return False
+        try: record=SheetRecord.from_row(self.adapter.read_row(receipt.immutable_location))
+        except (ValueError,ExternalServiceError): return False
+        return (record.verify() and record.appended_at==receipt.appended_at
+                and receipt.read_back_at>=receipt.appended_at
+                and record.artifact_id==receipt.artifact_id
+                and record.content_sha256==receipt.content_sha256)
+
+
+def production_trusted_attestor_factory(environ: Mapping[str, str] | None = None, *, transport=None):
+    env=os.environ if environ is None else environ
+    adapter=GoogleSheetsAdapter(token_provider=google_service_account_token_provider(env),transport=transport,environ=env)
+    adapter.preflight(env.get("GOOGLE_SHEETS_SPREADSHEET_ID",""))
+    return ProductionSheetAttestorPolicy(adapter,env["GOOGLE_SHEETS_SPREADSHEET_ID"])
+
+
 class SheetAttestationBoundary:
-    def __init__(self, port: AppendOnlySheetPort, external_system="google-sheets"):
-        self.port, self.external_system = port, external_system
+    _portfolio_lock = threading.Lock()
+    def __init__(self, port: AppendOnlySheetPort, external_system="google-sheets",
+                 provenance="disconnected-fixture"):
+        self.port, self.external_system, self.provenance = port, external_system, provenance
 
     def append(self, artifact: Mapping[str, Any], at: datetime) -> tuple[SheetRecord, str, bool]:
         record = SheetRecord.create(artifact, at)
-        for row in self.port.read_all():
+        for index, row in enumerate(self.port.read_all(), start=2):
             existing = SheetRecord.from_row(row)
-            if existing.record_id == record.record_id:
-                if existing.row() != record.row(): raise ValueError("duplicate record ID has different content")
-                return existing, f"record:{existing.record_id}", False
+            if existing.artifact_id == record.artifact_id:
+                if not existing.verify() or existing.payload_json != record.payload_json:
+                    raise ValueError("duplicate artifact ID has different content")
+                return existing, f"Attestations!A{index}:G{index}", False
         return record, self.port.append_row(record.row()), True
+
+    def append_activated(self, artifact: Mapping[str, Any], at: datetime, *, environ=None):
+        """Append only with the dedicated paper-ledger sentinel, then exact read-back."""
+        from .config import paper_ledger_enabled
+        if not paper_ledger_enabled(environ):
+            raise ValueError("paper-ledger append is disabled")
+        record, location, appended = self.append(artifact, at)
+        receipt, exact = self.read_back(record, location, at)
+        return record, location, (receipt, exact), appended
+
+    def append_envelope(self, artifact: Mapping[str, Any], at: datetime, *, parents=(),
+                        trusted_attestor=None, environ=None):
+        """Append/read back and return the complete immutable attested artifact."""
+        from .attestation import create_attested_artifact
+        record,location,pair,_=self.append_activated(artifact,at,environ=environ)
+        receipt,exact=pair
+        return create_attested_artifact(artifact,receipt,exact,parents=parents,
+                                        trusted_attestor=trusted_attestor)
+
+    def append_portfolio_envelope(self, artifact, at, *, trusted_attestor=None, environ=None):
+        """Compare-and-verify the canonical portfolio head around an append."""
+        expected=artifact.get('payload',{}).get('anchor_artifact_id')
+        with self._portfolio_lock:
+            before=[json.loads(SheetRecord.from_row(row).payload_json) for row in self.port.read_all()]
+            portfolios=[x for x in before if x.get('artifact_kind')=='portfolio_snapshot']
+            latest=portfolios[-1]['artifact_id'] if portfolios else None
+            if latest==artifact.get('artifact_id'):
+                return self.append_envelope(artifact,at,trusted_attestor=trusted_attestor,environ=environ)
+            if latest!=expected: raise ValueError('portfolio anchor is stale or not the latest canonical head')
+            envelope=self.append_envelope(artifact,at,trusted_attestor=trusted_attestor,environ=environ)
+            after=[json.loads(SheetRecord.from_row(row).payload_json) for row in self.port.read_all()]
+            children=[x for x in after if x.get('artifact_kind')=='portfolio_snapshot'
+                and x.get('payload',{}).get('anchor_artifact_id')==expected]
+            if len(children)!=1 or children[0].get('artifact_id')!=artifact.get('artifact_id'):
+                raise ValueError('competing portfolio continuation detected')
+            return envelope
 
     def read_back(self, record: SheetRecord, location: str, at: datetime) -> tuple[AttestationReceipt, Mapping[str, Any]]:
         require_utc(at, "read_back_at")
@@ -231,7 +307,7 @@ class SheetAttestationBoundary:
         return AttestationReceipt.create(artifact_id=record.artifact_id,
             external_system=self.external_system, appended_at=record.appended_at,
             immutable_location=location, read_back_at=at,
-            content_sha256=record.content_sha256, provenance="disconnected-fixture"), payload
+            content_sha256=record.content_sha256, provenance=self.provenance), payload
 
     def correction(self, bad_record_id: str, corrected_artifact: Mapping[str, Any], at: datetime) -> tuple[SheetRecord, str]:
         if not any(SheetRecord.from_row(row).record_id == bad_record_id for row in self.port.read_all()):
@@ -254,3 +330,16 @@ class SheetAttestationBoundary:
             elif key not in expected_by_id: differences.append(f"{key}: unexpected")
             elif actual_by_id[key].row() != expected_by_id[key].row(): differences.append(f"{key}: mismatch")
         return tuple(duplicates + differences)
+
+
+def production_sheet_boundary_factory(environ: Mapping[str, str] | None = None, *,
+                                      transport: Transport | None = None):
+    """Construct and preflight the production append boundary only when activated."""
+    from .config import paper_ledger_enabled
+    env=os.environ if environ is None else environ
+    if not paper_ledger_enabled(env): raise ValueError("paper-ledger append is disabled")
+    adapter=GoogleSheetsAdapter(token_provider=google_service_account_token_provider(env),
+        transport=transport,environ=env)
+    adapter.preflight(env.get("GOOGLE_SHEETS_SPREADSHEET_ID", ""))
+    return SheetAttestationBoundary(adapter, external_system="google-sheets:"+
+        env["GOOGLE_SHEETS_SPREADSHEET_ID"], provenance="authenticated-production")

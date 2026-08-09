@@ -182,7 +182,31 @@ out-of-coverage, unverified, or seal-invalid evidence quarantines the event.
   NAV, orders, or positions. Taxes, fees, and slippage beyond adverse-side fills
   are not accrued.
 
-## Offline sequential operational runs
+## Paper workflow orchestration (disabled by default)
+
+The operator workflow has four deliberately independent authority boundaries:
+
+1. **Read-only network activation** uses
+   `VALUE_OPTIONS_ENABLE_LIVE_READ_ONLY=I_UNDERSTAND_READ_ONLY_NETWORK_ACCESS`.
+   It permits only the allowlisted evidence GETs and never permits Sheet appends.
+2. **Paper-ledger append activation** separately uses
+   `VALUE_OPTIONS_ENABLE_PAPER_LEDGER_APPEND=I_AUTHORIZE_APPEND_ONLY_PAPER_LEDGER`.
+   Offline `workflow-preflight` reports configuration presence only and explicitly
+   makes no schema-verification claim. Activated
+   `workflow-preflight --live-read-only` verifies spreadsheet identity, the `Attestations` tab, and
+   its exact seven-column header without writing. Every actual append is
+   followed by an exact-range GET and immutable envelope; rows are never updated
+   or deleted.
+3. **Paper-fund launch authorization** remains a separate verified launch
+   workflow. Neither sentinel, an artifact, rehearsal, nor receipt changes it.
+4. **Live brokerage is prohibited.** There is no submit, cancel, replace, or live
+   order capability. `PAPER ONLY` and `NO LIVE ORDER` remain immutable.
+
+Production collection uses the CLI provider factory only after the read-only sentinel is present. It also requires the exact auxiliary-read sentinels `VALUE_OPTIONS_ENABLE_CORPORATE_ACTION_READS`, `VALUE_OPTIONS_ENABLE_DIVIDEND_READS`, and `VALUE_OPTIONS_ENABLE_GBPUSD_READS`; requests use only the fixed approved Alpaca host/path/query shapes; preflight remains launch-unready if any is absent. Connections and appends are off unless their respective exact sentinel is present. CI supplies fixtures only, without network, credentials, or Sheet
+writes. `workflow-rehearsal` is excluded and proves that cash, NAV, orders,
+positions, and launch status retain the same fingerprint.
+
+## Offline runs and prospective collection
 
 The operational path is deliberately three separate invocations. `research-run`
 seals its underlying-only input before option information is accepted;
@@ -194,13 +218,35 @@ ambiguous. Missing or malformed input produces a structured quarantine artifact.
 `replay` accepts combined historical bundles only as explicitly excluded,
 state-neutral test convenience. Every output says `PAPER ONLY` and `NO LIVE ORDER`:
 
+Those four commands remain historical/file-driven and retain caller-supplied
+timestamps. They are never used by prospective collection. In contrast, the
+three `*-collect` commands expose no `--at`, `--submitted-at`, or `--as-of` option:
+an injected UTC clock supplies request, observation, receipt, decision,
+submission, read-back, and fill times. Each prospective output is a complete immutable `AttestedArtifact` envelope; decision and submission are persisted separately with their exact parent chains. Atomic checkpoint files make completed
+provider work idempotent across restarts. If a Sheet append was interrupted after
+the external write, recovery locates and exactly reads back the existing row
+instead of appending another.
+
 ```bash
-value-options research-run research-input.json --at 2026-08-07T12:33:00Z --output artifacts/research.json
-value-options decision-run artifacts/research.json decision-evidence.json --at 2026-08-07T13:42:00Z --submitted-at 2026-08-07T13:42:01Z --decision-output artifacts/decision.json --submission-output artifacts/submission.json
-value-options fill-run artifacts/decision.json artifacts/submission.json post-submission-option-quote.json --as-of 2026-08-07T13:42:05Z --output artifacts/fill.json
-value-options replay evidence-bundle.json --as-of 2026-08-07T13:40:30Z --output artifacts/replay.json
+value-options workflow-preflight                         # configuration only
+value-options workflow-preflight --live-read-only       # activated provider/schema reads
+value-options portfolio-collect paper-ledger.json --initialize --output artifacts/portfolio-snapshot.json  # one-time empty-ledger bootstrap
+value-options research-collect research-input.json --output artifacts/research.json --checkpoint state/research.json
+value-options decision-collect artifacts/research.json artifacts/portfolio-snapshot.json proposed-operation.json --decision-output artifacts/decision.json --submission-output artifacts/submission.json --checkpoint state/decision.json
+value-options fill-collect artifacts/research.json artifacts/portfolio-snapshot.json artifacts/decision.json artifacts/submission.json --output artifacts/fill.json --checkpoint state/fill.json
+value-options workflow-rehearsal evidence-bundle.json --state fund-state.json --as-of 2026-08-07T13:40:30Z --output artifacts/rehearsal.json
 value-options inspect tests/fixtures/alpaca_opra_quote.json --as-of 2026-08-07T13:40:03Z --output artifacts/inspection.json
 ```
+
+`portfolio-collect` never accepts an operator-authored replacement snapshot. It verifies each content-addressed/sealed record, declared record count/head, and ordered predecessor chain, then deterministically replays append-only ledger records for initialization, cash, positions, marks, valuation comparisons, and pending-submission/resolution events; NAV is recomputed as cash plus marked long holdings minus marked short-option liabilities; reservations never reduce NAV and instead reduce only free cash and mandate capacity, while stated valuations are evidence that must agree; `--initialize` is accepted only once against an empty ledger and creates the £100,000 bootstrap. Non-bootstrap imports must continue a previously externally attested snapshot head/count, so a fully fabricated and locally resealed history fails closed. USD put collateral is converted to GBP by dividing by a fresh, finite, positive, two-sided sealed GBPUSD midpoint. Portfolio continuation compares against the latest canonical externally attested Sheet head before append and verifies that no competing child appeared afterward; stale, rollback, and fork attempts fail closed. The sealed snapshot retains every source record ID and may be compared with `--expected-state` for reconciliation.
+
+The collect commands enforce externally attested research → trusted, externally attested portfolio-snapshot envelope → externally attested decision → externally attested submission → fill ancestry; local artifacts fail closed at prospective boundaries. Portfolio snapshots reconstruct actual cash, NAV, peak NAV/drawdown, holdings, option shorts and marks, so existing CSP collateral, covered calls, and issuer/sector usage enter the authoritative risk calculation.
+Research accepts only underlying/thesis pairs; prospective code obtains clock,
+calendar, and every underlying quote through injected read-only provider ports. Decision uses fresh complete evidence, OPRA contract data, and
+explicit corporate-action, dividend, and GBP/USD provider ports, deterministic traversal of every option-chain page token, and the
+mandate/risk engine, then seals decision separately before simulated
+submission. Fill re-verifies all ancestors and fetches a new exact-contract OPRA quote itself,
+observed and received after submission; buys use ask and sells use bid. Corporate-action and dividend collection accepts authenticated empty results only when they explicitly bind the requested symbol and coverage dates.
 
 Operational commands exit non-zero whenever a research, decision, submission, or
 fill stage is quarantined, invalid, or non-actionable, so schedulers cannot mistake
