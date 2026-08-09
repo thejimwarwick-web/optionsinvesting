@@ -1,0 +1,16 @@
+{
+  "spreadsheetId": "fixture_sheet",
+  "tableRange": "Attestations!A1:G1",
+  "updates": {
+    "spreadsheetId": "fixture_sheet",
+    "updatedRange": "Attestations!A2:G2",
+    "updatedRows": 1,
+    "updatedColumns": 7,
+    "updatedCells": 7,
+    "updatedData": {
+      "range": "Attestations!A2:G2",
+      "majorDimension": "ROWS",
+      "values": [["id", "artifact", "artifact-1", "hash", "2026-08-07T13:42:00+00:00", "{}"]]
+    }
+  }
+}

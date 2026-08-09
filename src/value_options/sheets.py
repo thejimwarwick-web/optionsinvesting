@@ -5,14 +5,26 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
+import os
+from urllib.parse import quote, urlencode, urlsplit
 from typing import Any, Iterable, Mapping, Protocol, Sequence
 
 from .attestation import AttestationReceipt
 from .market_data import canonical_json
 from .models import require_utc
+from .http import ExternalServiceError, HttpResponse, Transport, UrllibTransport
 
 HEADERS = ("record_id", "record_type", "artifact_id", "content_sha256", "appended_at",
            "payload_json", "corrects_record_id")
+
+
+def normalize_values_row(row: Sequence[Any]) -> list[str]:
+    """Pad only Values API's documented omission of trailing empty cells."""
+    if not isinstance(row, (list, tuple)) or len(row) > len(HEADERS):
+        raise ValueError("invalid sheet row width")
+    values = list(row)
+    if any(not isinstance(cell, str) for cell in values): raise ValueError("sheet cells must be strings")
+    return values + [""] * (len(HEADERS) - len(values))
 
 
 @dataclass(frozen=True)
@@ -43,7 +55,7 @@ class SheetRecord:
 
     @classmethod
     def from_row(cls, row: Sequence[str]) -> "SheetRecord":
-        if len(row) != len(HEADERS): raise ValueError("invalid sheet row width")
+        row = normalize_values_row(row)
         return cls(row[0], row[1], row[2], row[3], datetime.fromisoformat(row[4]), row[5], row[6])
 
     def verify(self) -> bool:
@@ -60,6 +72,136 @@ class AppendOnlySheetPort(Protocol):
     def append_row(self, row: Sequence[str]) -> str: ...
     def read_row(self, immutable_location: str) -> Sequence[str]: ...
     def read_all(self) -> Iterable[Sequence[str]]: ...
+
+
+class GoogleSheetsAdapter:
+    """Narrow Google Values adapter: GET values and POST append only.
+
+    OAuth token acquisition is delegated to an injected token provider (normally
+    ``google.auth``); tokens and spreadsheet identity are accepted only from the
+    process environment. There is intentionally no update, batchUpdate or clear.
+    """
+    HOST = "sheets.googleapis.com"
+
+    def __init__(self, *, token_provider, transport: Transport | None = None,
+                 environ: Mapping[str, str] | None = None, sheet_range="Attestations!A:G"):
+        env = os.environ if environ is None else environ
+        self._spreadsheet = env.get("GOOGLE_SHEETS_SPREADSHEET_ID", "")
+        if not self._spreadsheet or not self._spreadsheet.replace("-", "").replace("_", "").isalnum():
+            raise ValueError("valid Google spreadsheet ID environment value required")
+        if not env.get("GOOGLE_SERVICE_ACCOUNT_JSON"): raise ValueError("Google service-account environment credential required")
+        self._token_provider, self._transport, self._range = token_provider, transport or UrllibTransport(), sheet_range
+
+    def _request(self, method, suffix, *, body=None, query=None, value_range=None):
+        if method not in {"GET", "POST"}: raise ValueError("Google method not allowlisted")
+        base = f"/v4/spreadsheets/{self._spreadsheet}/values/"
+        path = base + quote(self._range if value_range is None else value_range, safe="") + suffix
+        if (method, suffix) not in {("GET", ""), ("POST", ":append")}:
+            raise ValueError("Google endpoint not allowlisted")
+        url = f"https://{self.HOST}{path}" + ("?" + urlencode(query) if query else "")
+        payload = None if body is None else canonical_json(body)
+        if method == "GET" and payload is not None: raise ValueError("GET request bodies forbidden")
+        try:
+            token = self._token_provider()
+            if not isinstance(token, str) or not token: raise ValueError
+            response = self._transport.request(method, url, headers={"Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"}, body=payload)
+        except Exception:
+            raise ExternalServiceError("Google API request failed") from None
+        final = urlsplit(response.url)
+        if final.scheme != "https" or final.hostname != self.HOST or 300 <= response.status < 400:
+            raise ValueError("Google redirect or unapproved response host")
+        if response.status < 200 or response.status >= 300: raise ValueError(f"Google Sheets failed with HTTP {response.status}")
+        try: result = json.loads(response.body or b"{}")
+        except (TypeError, json.JSONDecodeError, UnicodeDecodeError):
+            raise ExternalServiceError("Google API returned an invalid response") from None
+        if not isinstance(result, Mapping):
+            raise ExternalServiceError("Google API returned an unexpected response structure")
+        return result
+
+    def append_row(self, row):
+        expected = normalize_values_row(row)
+        result = self._request("POST", ":append", body={"majorDimension": "ROWS", "values": [list(row)]},
+            query={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS", "includeValuesInResponse": "true"})
+        updates = result.get("updates", {})
+        if not isinstance(updates, Mapping) or not isinstance(updates.get("updatedData"), Mapping):
+            raise ExternalServiceError("Google append returned an unexpected response structure")
+        echoed = updates.get("updatedData", {}).get("values")
+        if updates.get("updatedRows") != 1 or not isinstance(echoed, list) or len(echoed) != 1:
+            raise ExternalServiceError("Google append returned an unexpected response structure")
+        if self._provider_row(echoed[0]) != expected:
+            raise ValueError("Google append response did not exactly echo one row")
+        location = updates.get("updatedRange", "")
+        if not location: raise ValueError("Google append omitted updated range")
+        return location
+
+    def read_row(self, immutable_location):
+        rows = self._values(self._request("GET", "", value_range=immutable_location))
+        if len(rows) != 1: raise ValueError("expected exactly one Google row")
+        return self._provider_row(rows[0])
+
+    def read_all(self):
+        rows = [self._provider_row(row) for row in self._values(self._request("GET", ""))]
+        if rows and tuple(rows[0]) == HEADERS: rows.pop(0)
+        return tuple(tuple(row) for row in rows)
+
+    @staticmethod
+    def _values(result):
+        rows = result.get("values", [])
+        if not isinstance(rows, list) or any(not isinstance(row, list) for row in rows):
+            raise ExternalServiceError("Google values returned an unexpected response structure")
+        return rows
+
+    @staticmethod
+    def _provider_row(row):
+        try: return normalize_values_row(row)
+        except (TypeError, ValueError):
+            raise ExternalServiceError("Google values returned an unexpected response structure") from None
+
+
+def google_service_account_token_provider(environ: Mapping[str, str] | None = None):
+    """Build a refresh-on-use provider using Google's official auth library."""
+    env = os.environ if environ is None else environ
+    try: info = json.loads(env["GOOGLE_SERVICE_ACCOUNT_JSON"])
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise ExternalServiceError("Google service-account configuration is invalid") from None
+    if info.get("token_uri") != "https://oauth2.googleapis.com/token":
+        raise ValueError("service-account token_uri is not approved")
+    try:
+        from google.oauth2.service_account import Credentials
+        credentials = Credentials.from_service_account_info(info,
+            scopes=("https://www.googleapis.com/auth/spreadsheets",))
+    except Exception:
+        raise ExternalServiceError("Google service-account configuration is invalid") from None
+    request = _NoRedirectGoogleAuthRequest()
+    def token():
+        try:
+            if not credentials.valid: credentials.refresh(request)
+        except Exception:
+            raise ExternalServiceError("Google OAuth token refresh failed") from None
+        return credentials.token
+    return token
+
+
+class _GoogleAuthResponse:
+    def __init__(self, response: HttpResponse):
+        self.status, self.data, self.headers = response.status, response.body, response.headers
+
+
+class _NoRedirectGoogleAuthRequest:
+    """google-auth transport restricted to the single official OAuth endpoint."""
+    TOKEN_URL = "https://oauth2.googleapis.com/token"
+    def __init__(self, transport: Transport | None = None): self.transport = transport or UrllibTransport()
+    def __call__(self, url, method="GET", body=None, headers=None, timeout=120, **kwargs):
+        if url != self.TOKEN_URL or method.upper() != "POST":
+            raise ExternalServiceError("Google OAuth request rejected")
+        try: response = self.transport.request("POST", url, headers=headers or {}, body=body)
+        except Exception: raise ExternalServiceError("Google OAuth request failed") from None
+        final = urlsplit(response.url)
+        if final.scheme != "https" or final.hostname != "oauth2.googleapis.com" or final.path != "/token" or \
+                300 <= response.status < 400:
+            raise ExternalServiceError("Google OAuth response rejected")
+        return _GoogleAuthResponse(response)
 
 
 class FixtureAttestorPolicy:

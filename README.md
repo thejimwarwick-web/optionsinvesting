@@ -1,8 +1,9 @@
 # Value & Options Paper Fund — deterministic control foundation
 
-This repository is an offline, standard-library-only paper-fund control plane. It
-does **not** connect to Google Sheets or Alpaca, contain credentials, expose broker
-order methods, use margin, or submit live trades.
+This repository is an offline-by-default paper-fund control plane. Optional,
+explicitly activated production adapters can read Alpaca and append/read Google
+Sheets attestations; they contain no broker order methods and can never submit,
+cancel, or replace a trade.
 
 ## Implemented mandate
 
@@ -56,7 +57,31 @@ same state, and reconciliation reports missing, unexpected, or mismatched record
 `AppendOnlyLedgerSink` is only a port for a future Google Sheets adapter.
 `ReadOnlyAlpaca` deliberately exposes reads only.
 
-## External attestation boundaries (not connected)
+## Production adapters (disabled by default)
+
+The Alpaca adapter has no general-purpose request method. Its complete allowlist is
+`GET https://paper-api.alpaca.markets/v2/clock`, `GET /v2/calendar`, and these
+`data.alpaca.markets` reads: `/v2/stocks/{symbol}/quotes/latest`,
+`/v1beta1/options/snapshots/{underlying}`, and
+`/v1beta1/options/quotes/latest`. Symbols are restricted to alphanumerics and a
+dot. Bodies, redirects, other hosts/methods/paths, and anything containing order,
+account, cancel, or replace are rejected. Raw bytes and parsed JSON are retained
+with request ID, named feed, provider/receipt times, SHA-256, and an evidence seal.
+
+The Google adapter allows only Values `GET` and the single Values `POST :append`
+operation (Google uses POST for append). It has no update, clear, batch-update, or
+delete surface. The append uses `RAW` and `INSERT_ROWS`, requires Google's response
+to echo exactly one identical row, and the attestation boundary then GETs the exact
+returned range and compares every cell before creating a trusted receipt.
+Google's documented omission of trailing empty cells is normalized by padding only
+the missing tail to the fixed seven-column schema; internal omissions, extra cells,
+and other differences still fail. The exact header row is explicitly excluded from
+attestation records.
+The endpoint shapes follow the official [Alpaca Trading/Data API documentation](https://docs.alpaca.markets/reference)
+and [Google Sheets Values API documentation](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values).
+Service-account metadata must name exactly
+`https://oauth2.googleapis.com/token`; OAuth uses the same no-redirect transport
+policy and rejects every other URL or redirected response.
 
 `SheetAttestationBoundary` serializes Google Sheets-compatible rows and permits
 only append and read operations. It idempotently compares duplicate record IDs,
@@ -79,12 +104,19 @@ The Alpaca port exposes only clock, calendar, underlying quote, option-chain, an
 option-quote reads. Captured evidence retains the untouched response, provider and
 receipt timestamps, request ID, feed identity, and raw-response hash. CI uses the
 injected fixture adapter and performs no network access.
+Only timestamps actually present in the documented clock, latest-quote, or snapshot
+response structures are recorded. Calendar and malformed/missing timestamp fields
+remain explicitly unavailable, and timestamp-dependent use quarantines them rather
+than substituting local receipt time.
 
 ### Future manual configuration
 
-When separately reviewed adapters are implemented, operators must supply
+Install the optional runtime dependency with `pip install '.[live]'`. Operators
+must inject (never write to a file, command line, log, or sheet)
 `ALPACA_API_KEY_ID`, `ALPACA_API_SECRET_KEY`, `GOOGLE_SHEETS_SPREADSHEET_ID`, and
-`GOOGLE_SERVICE_ACCOUNT_JSON` as process environment variables. Credentials must
+`GOOGLE_SERVICE_ACCOUNT_JSON` as process environment variables. The service
+account must have access only to the intended spreadsheet; the Alpaca key should
+be a dedicated least-privilege paper/read-only key. Credentials must
 never be command-line arguments, logs, artifacts, repository files, or spreadsheet
 values. The safe configuration check displays names and booleans only:
 
@@ -95,6 +127,20 @@ value-options preflight
 It returns non-zero when any value is absent and always remains launch-ineligible.
 Configuration alone does not authorize connection, ledger access, or fund launch.
 
+After independent review, manually enable network reads in that one process only:
+
+```bash
+export VALUE_OPTIONS_ENABLE_LIVE_READ_ONLY=I_UNDERSTAND_READ_ONLY_NETWORK_ACCESS
+value-options preflight --live-read-only
+unset VALUE_OPTIONS_ENABLE_LIVE_READ_ONLY
+```
+
+This performs only an Alpaca clock GET and a Google values GET. It reports zero
+writes and zero orders. It never appends an attestation, accesses account state,
+or calls a broker write endpoint. Do not run this command in CI. Attestation
+appends must be invoked by a separately reviewed operator workflow, followed by
+the adapter's exact-range read-back before any receipt is trusted.
+
 Exchange sessions are never inferred from weekdays. Live and replay processing
 require a verified, sealed `MarketCalendarEvidence` observation whose coverage
 contains the event and a subsequent open session. The read-only evidence port is
@@ -103,7 +149,8 @@ out-of-coverage, unverified, or seal-invalid evidence quarantines the event.
 
 ## Deliberate limitations
 
-* No live ledger or broker adapter is implemented.
+* Live adapters are inert until credentials and the exact activation sentinel are
+  supplied; CI never supplies either and uses fixture transports only.
 * No calendar downloader or holiday database is embedded. An operator must store
   authoritative calendar evidence before lifecycle processing can proceed.
 * Corporate-action terms remain quarantined until an external OCC-verification
