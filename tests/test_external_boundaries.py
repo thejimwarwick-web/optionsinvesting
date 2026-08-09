@@ -6,7 +6,9 @@ import pytest
 
 from value_options.attestation import (AttestationReceipt, AttestedArtifact,
     create_attested_artifact, verify_attested_artifact)
-from value_options.broker import FixtureAlpaca, ProviderResponse, ReadOnlyAlpaca
+from value_options.broker import AlpacaReadOnlyClient, FixtureAlpaca, ProviderResponse, ReadOnlyAlpaca
+from value_options.http import HttpResponse
+from value_options.sheets import GoogleSheetsAdapter
 from value_options.cli import main
 from value_options.config import preflight, redact
 from value_options.operations import seal_artifact
@@ -132,3 +134,48 @@ def test_environment_preflight_and_secrets_inside_innocent_strings_and_errors(ca
     assert all(secret not in str(cleaned) for secret in secrets.values())
     assert main(["preflight"]) == 2 and "secret-456" not in capsys.readouterr().out
     with pytest.raises(SystemExit): main(["preflight", "--api-key", "secret-456"])
+
+
+class FakeHttp:
+    def __init__(self, response): self.response=response; self.calls=[]
+    def request(self, method, url, *, headers, body=None):
+        self.calls.append((method,url,headers,body)); return self.response
+
+
+def test_production_alpaca_is_exact_get_only_and_preserves_wire_bytes():
+    wire=b'{"timestamp":"2026-08-07T13:42:00Z","is_open":true}'
+    transport=FakeHttp(HttpResponse(200,{"x-request-id":"req-42"},wire,
+        "https://paper-api.alpaca.markets/v2/clock"))
+    client=AlpacaReadOnlyClient(transport=transport,environ={
+        "ALPACA_API_KEY_ID":"not-real", "ALPACA_API_SECRET_KEY":"not-real"})
+    result=client.clock()
+    assert transport.calls[0][0]=="GET" and transport.calls[0][3] is None
+    assert result.raw_response==wire and result.request_id=="req-42" and result.evidence_seal
+    with pytest.raises(ValueError,match="invalid symbol"): client.underlying_quote("AAPL/orders")
+    redirected=FakeHttp(HttpResponse(302,{"Location":"https://evil.test"},b"",
+        "https://evil.test/steal"))
+    with pytest.raises(ValueError,match="redirect"):
+        AlpacaReadOnlyClient(transport=redirected,environ={
+            "ALPACA_API_KEY_ID":"x","ALPACA_API_SECRET_KEY":"y"}).clock()
+
+
+def test_live_preflight_remains_disabled_without_activation(monkeypatch, capsys):
+    for name in ("ALPACA_API_KEY_ID","ALPACA_API_SECRET_KEY","GOOGLE_SHEETS_SPREADSHEET_ID","GOOGLE_SERVICE_ACCOUNT_JSON"):
+        monkeypatch.setenv(name,"fixture-only")
+    assert main(["preflight","--live-read-only"])==2
+    assert "disabled" not in capsys.readouterr().out  # diagnostics expose counts, not secrets/errors
+
+
+def test_google_adapter_append_allowlist_and_exact_echo():
+    row=["id","artifact","a","hash",AT.isoformat(),"{}",""]
+    response=(b'{"updates":{"updatedRows":1,"updatedRange":"Attestations!A2:G2",'
+              b'"updatedData":{"values":[["id","artifact","a","hash",'
+              b'"2026-08-07T13:42:00+00:00","{}",""]]}}}')
+    transport=FakeHttp(HttpResponse(200,{},response,
+        "https://sheets.googleapis.com/v4/spreadsheets/sheet_fixture/values/Attestations%21A%3AG:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS&includeValuesInResponse=true"))
+    adapter=GoogleSheetsAdapter(token_provider=lambda:"token",transport=transport,environ={
+        "GOOGLE_SHEETS_SPREADSHEET_ID":"sheet_fixture","GOOGLE_SERVICE_ACCOUNT_JSON":"{}"})
+    assert adapter.append_row(row)=="Attestations!A2:G2"
+    method,url,headers,body=transport.calls[0]
+    assert method=="POST" and ":append?" in url and b'"values"' in body
+    assert "token" not in body.decode()

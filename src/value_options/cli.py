@@ -14,7 +14,7 @@ from .operations import PaperRun, seal_artifact, verify_artifact
 from .market_data import canonical_json
 import hashlib
 from .risk import PortfolioRisk
-from .config import preflight
+from .config import live_read_only_enabled, preflight, redact
 
 
 def _time(value): return datetime.fromisoformat(value).astimezone(timezone.utc)
@@ -77,11 +77,21 @@ def main(argv=None):
     d=sub.add_parser("decision-run"); d.add_argument("research",type=Path); d.add_argument("bundle",type=Path); d.add_argument("--at",required=True); d.add_argument("--submitted-at",required=True); d.add_argument("--decision-output",type=Path,required=True); d.add_argument("--submission-output",type=Path,required=True)
     f=sub.add_parser("fill-run"); f.add_argument("decision",type=Path); f.add_argument("submission",type=Path); f.add_argument("quote",type=Path); f.add_argument("--as-of",required=True); f.add_argument("--output",type=Path,required=True)
     rp=sub.add_parser("replay"); rp.add_argument("bundle",type=Path); rp.add_argument("--as-of",required=True); rp.add_argument("--output",type=Path,required=True)
-    sub.add_parser("preflight")
+    pf=sub.add_parser("preflight"); pf.add_argument("--live-read-only",action="store_true")
     args=parser.parse_args(argv); run=_run(); artifact=None
     try:
         if args.command=="preflight":
             configured,artifact=preflight()
+            if args.live_read_only:
+                if not configured: raise ValueError("live read-only preflight requires all environment credentials")
+                if not live_read_only_enabled(): raise ValueError("live integration is disabled; set the documented activation environment value")
+                # Deliberately harmless reads only: clock and attestation range.
+                from .broker import AlpacaReadOnlyClient
+                from .sheets import GoogleSheetsAdapter, google_service_account_token_provider
+                clock=AlpacaReadOnlyClient().clock()
+                rows=GoogleSheetsAdapter(token_provider=google_service_account_token_provider()).read_all()
+                artifact["live_read_only"]={"alpaca_clock_request_id":clock.request_id,
+                    "alpaca_evidence_seal":clock.evidence_seal,"sheet_rows_read":len(rows),"writes":0,"orders":0}
         elif args.command=="inspect":
             p=load_packet(_read(args.packet)); result=assess(p,as_of=_time(args.as_of),cutoff=_time(args.as_of),max_age=None); artifact={"mode":"inspection",**asdict(result)}
         elif args.command=="research-run":
@@ -123,7 +133,7 @@ def main(argv=None):
         else:
             report=run.excluded_replay(_packets(args.bundle),as_of=_time(args.as_of)); artifact={"mode":"replay",**report.jsonable()}
     except (KeyError,TypeError,ValueError,ArithmeticError) as error:
-        artifact=_quarantine(args.command,[str(error) or error.__class__.__name__])
+        artifact=_quarantine(args.command,[redact(str(error)) or error.__class__.__name__])
     artifact.update({"classification":"PAPER ONLY","order_policy":"NO LIVE ORDER"})
     output=getattr(args,"output",None)
     if output: _write(output,artifact)
@@ -132,7 +142,7 @@ def main(argv=None):
         # misleading partial decision or submission behind.
         _write(args.decision_output,artifact); _write(args.submission_output,artifact)
     print(f"PAPER ONLY | NO LIVE ORDER | {args.command} | configured={configured if args.command == 'preflight' else 'n/a'} | actionable={artifact.get('actionable', False)} | reasons={len(artifact.get('reasons',[]))}")
-    if args.command == "preflight": return 0 if configured else 2
+    if args.command == "preflight": return 0 if configured and not artifact.get("quarantined") else 2
     return 1 if args.command in {"research-run","decision-run","fill-run"} and (
         artifact.get("quarantined") or not artifact.get("actionable",False)) else 0
 

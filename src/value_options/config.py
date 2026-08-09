@@ -6,6 +6,7 @@ from typing import Mapping
 
 REQUIRED_ENV = ("ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY",
                 "GOOGLE_SHEETS_SPREADSHEET_ID", "GOOGLE_SERVICE_ACCOUNT_JSON")
+LIVE_ENABLE_ENV = "VALUE_OPTIONS_ENABLE_LIVE_READ_ONLY"
 _SECRET_NAME = re.compile(r"(secret|token|password|credential|api.?key|service_account)", re.I)
 
 
@@ -36,3 +37,8 @@ def preflight(environ: Mapping[str, str] | None = None) -> tuple[bool, dict]:
     present = all(status.values())
     return present, {"configuration": status, "launch_eligible": False,
                      "classification": "PAPER ONLY", "order_policy": "NO LIVE ORDER"}
+
+
+def live_read_only_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    values = os.environ if environ is None else environ
+    return values.get(LIVE_ENABLE_ENV) == "I_UNDERSTAND_READ_ONLY_NETWORK_ACCESS"
