@@ -56,6 +56,41 @@ same state, and reconciliation reports missing, unexpected, or mismatched record
 `AppendOnlyLedgerSink` is only a port for a future Google Sheets adapter.
 `ReadOnlyAlpaca` deliberately exposes reads only.
 
+## External attestation boundaries (not connected)
+
+`SheetAttestationBoundary` serializes Google Sheets-compatible rows and permits
+only append and read operations. It idempotently compares duplicate record IDs,
+verifies exact read-back content before issuing an external receipt, reconciles
+expected history, and represents fixes as new correction rows pointing at the old
+row. It has no update or delete operation. No Google SDK or real spreadsheet ID is
+used by this repository or CI.
+
+An attestation receipt records the artifact ID, external system, append time,
+immutable row location, read-back time, and SHA-256 content hash. A paper artifact
+becomes externally attested only after exact read-back verification. Launch
+eligibility additionally requires every supplied ancestor to already be attested;
+attestation never changes `PAPER ONLY` or `NO LIVE ORDER`.
+
+The Alpaca port exposes only clock, calendar, underlying quote, option-chain, and
+option-quote reads. Captured evidence retains the untouched response, provider and
+receipt timestamps, request ID, feed identity, and raw-response hash. CI uses the
+injected fixture adapter and performs no network access.
+
+### Future manual configuration
+
+When separately reviewed adapters are implemented, operators must supply
+`ALPACA_API_KEY_ID`, `ALPACA_API_SECRET_KEY`, `GOOGLE_SHEETS_SPREADSHEET_ID`, and
+`GOOGLE_SERVICE_ACCOUNT_JSON` as process environment variables. Credentials must
+never be command-line arguments, logs, artifacts, repository files, or spreadsheet
+values. The safe configuration check displays names and booleans only:
+
+```bash
+value-options preflight
+```
+
+It returns non-zero when any value is absent and always remains launch-ineligible.
+Configuration alone does not authorize connection, ledger access, or fund launch.
+
 Exchange sessions are never inferred from weekdays. Live and replay processing
 require a verified, sealed `MarketCalendarEvidence` observation whose coverage
 contains the event and a subsequent open session. The read-only evidence port is

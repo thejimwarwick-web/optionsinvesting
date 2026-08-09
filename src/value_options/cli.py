@@ -14,6 +14,7 @@ from .operations import PaperRun, seal_artifact, verify_artifact
 from .market_data import canonical_json
 import hashlib
 from .risk import PortfolioRisk
+from .config import preflight
 
 
 def _time(value): return datetime.fromisoformat(value).astimezone(timezone.utc)
@@ -76,9 +77,12 @@ def main(argv=None):
     d=sub.add_parser("decision-run"); d.add_argument("research",type=Path); d.add_argument("bundle",type=Path); d.add_argument("--at",required=True); d.add_argument("--submitted-at",required=True); d.add_argument("--decision-output",type=Path,required=True); d.add_argument("--submission-output",type=Path,required=True)
     f=sub.add_parser("fill-run"); f.add_argument("decision",type=Path); f.add_argument("submission",type=Path); f.add_argument("quote",type=Path); f.add_argument("--as-of",required=True); f.add_argument("--output",type=Path,required=True)
     rp=sub.add_parser("replay"); rp.add_argument("bundle",type=Path); rp.add_argument("--as-of",required=True); rp.add_argument("--output",type=Path,required=True)
+    sub.add_parser("preflight")
     args=parser.parse_args(argv); run=_run(); artifact=None
     try:
-        if args.command=="inspect":
+        if args.command=="preflight":
+            configured,artifact=preflight()
+        elif args.command=="inspect":
             p=load_packet(_read(args.packet)); result=assess(p,as_of=_time(args.as_of),cutoff=_time(args.as_of),max_age=None); artifact={"mode":"inspection",**asdict(result)}
         elif args.command=="research-run":
             source=_read(args.input); _validate_research_input(source)
@@ -125,7 +129,8 @@ def main(argv=None):
         # A failed stage emits reports at both requested paths and never leaves a
         # misleading partial decision or submission behind.
         _write(args.decision_output,artifact); _write(args.submission_output,artifact)
-    print(f"PAPER ONLY | NO LIVE ORDER | {args.command} | actionable={artifact.get('actionable', False)} | reasons={len(artifact.get('reasons',[]))}")
+    print(f"PAPER ONLY | NO LIVE ORDER | {args.command} | configured={configured if args.command == 'preflight' else 'n/a'} | actionable={artifact.get('actionable', False)} | reasons={len(artifact.get('reasons',[]))}")
+    if args.command == "preflight": return 0 if configured else 2
     return 1 if args.command in {"research-run","decision-run","fill-run"} and (
         artifact.get("quarantined") or not artifact.get("actionable",False)) else 0
 
