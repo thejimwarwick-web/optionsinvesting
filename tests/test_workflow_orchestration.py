@@ -1,12 +1,13 @@
 import json, os, re, subprocess, sys
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 import pytest
 
 from value_options.cli import main
 from value_options.operations import seal_artifact
 from value_options.attestation import AttestationReceipt, create_attested_artifact
-from value_options.market_data import EvidenceKind, canonical_json
+from value_options.market_data import EvidenceKind, canonical_json, ingest_response
 import hashlib
 from value_options.sheets import GoogleSheetsAdapter, HEADERS, SheetAttestationBoundary
 from value_options.workflow import ReadResult
@@ -76,8 +77,8 @@ def seal_history(rows):
     for sequence,row in enumerate(rows): result.append(seal_ledger_record(row,sequence=sequence,previous_record_id=result[-1]['record_id'] if result else ''))
     return result
 
-def ledger_source(records):
-    return {'records':records,'record_count':len(records),'head_record_id':records[-1]['record_id'] if records else ''}
+def ledger_source(records,anchor=None):
+    return {'records':records,'record_count':len(records),'head_record_id':records[-1]['record_id'] if records else '','anchor':anchor}
 
 def collect_research(tmp_path,clock,providers):
     source=tmp_path/'candidates.json'; out=tmp_path/'research.json'; write(source,{'candidates':[{'underlying':'AAPL','thesis':'value'}]})
@@ -237,7 +238,7 @@ def test_portfolio_collect_replays_nonempty_ledger_and_rejects_disagreement(tmp_
         {'record_id':'position-1','kind':'position','instrument':equity,'quantity_delta':10,'cost_basis_delta_gbp':'1000'},
         {'record_id':'mark-1','kind':'mark','instrument':equity,'mark_gbp':'110'},
         {'record_id':'valuation-1','kind':'valuation','nav_gbp':'100100','peak_nav_gbp':'100100'}]}
-    ledger=ledger_source(seal_history(ledger['records']))
+    ledger=ledger_source(seal_history(ledger['records']),portfolio_artifact())
     source=tmp_path/'ledger.json'; output=tmp_path/'portfolio.json'; write(source,ledger)
     clock=TickClock(AT)
     assert main(['portfolio-collect',str(source),'--output',str(output)],utc_clock=clock,
@@ -269,7 +270,7 @@ def test_ledger_replay_rejects_falsified_nav_negative_shares_and_cost_basis():
         [init,{'kind':'position','instrument':equity,'quantity_delta':-1,'cost_basis_delta_gbp':'0'}],
         [init,{'kind':'position','instrument':equity,'quantity_delta':1,'cost_basis_delta_gbp':'-1'}]]
     for rows in cases:
-        with pytest.raises(ValueError): portfolio_collect(ledger_source(seal_history(rows)))
+        with pytest.raises(ValueError): portfolio_collect(ledger_source(seal_history(rows),portfolio_artifact()),trusted_attestor=TRUSTED)
 
 
 def test_ledger_replay_rejects_duplicate_pending_and_altered_history():
@@ -277,13 +278,41 @@ def test_ledger_replay_rejects_duplicate_pending_and_altered_history():
         'reserved_cash_gbp':'0','reserved_collateral_gbp':'2000','covered_shares':0,'submission_artifact_id':'submission-1'}
     history=seal_history([{'kind':'portfolio_initialized','cash_gbp':'100000','nav_gbp':'100000','peak_nav_gbp':'100000'}, {'kind':'pending_submission','submission':submission}, {'kind':'pending_submission','submission':submission}])
     with pytest.raises(ValueError,match='duplicate pending'):
-        portfolio_collect(ledger_source(history))
+        portfolio_collect(ledger_source(history,portfolio_artifact()),trusted_attestor=TRUSTED)
     altered=dict(history[1]); altered['submission']={**submission,'quantity':2}
     with pytest.raises(ValueError,match='altered'):
-        portfolio_collect(ledger_source([history[0],altered]))
+        portfolio_collect(ledger_source([history[0],altered],portfolio_artifact()),trusted_attestor=TRUSTED)
     with pytest.raises(ValueError,match='reordered'):
-        portfolio_collect(ledger_source([history[0],history[2],history[1]]))
-    missing=ledger_source(history[:-1]); missing['record_count']=len(history)
+        portfolio_collect(ledger_source([history[0],history[2],history[1]],portfolio_artifact()),trusted_attestor=TRUSTED)
+    missing=ledger_source(history[:-1],portfolio_artifact()); missing['record_count']=len(history)
     missing['head_record_id']=history[-1]['record_id']
     with pytest.raises(ValueError,match='missing'):
         portfolio_collect(missing)
+
+
+def test_pending_reservation_reduces_free_cash_not_nav_or_drawdown():
+    submission={'instrument':proposal()['operation']['instrument'],'side':'sell','intent':'open','quantity':1,
+        'reserved_cash_gbp':'10000','reserved_collateral_gbp':'2000','covered_shares':0,'submission_artifact_id':'pending-1'}
+    rows=seal_history([{'kind':'portfolio_initialized','cash_gbp':'100000','nav_gbp':'100000','peak_nav_gbp':'100000'},
+        {'kind':'pending_submission','submission':submission},
+        {'kind':'valuation','nav_gbp':'100000','peak_nav_gbp':'100000'}])
+    artifact=portfolio_collect(ledger_source(rows,portfolio_artifact()),trusted_attestor=TRUSTED)
+    payload=artifact['payload']; assert payload['nav_gbp']=='100000' and payload['drawdown']=='0'
+    envelope=attest(artifact); reconstructed=__import__('value_options.workflow',fromlist=['portfolio_from_artifact']).portfolio_from_artifact(envelope,TRUSTED)
+    assert reconstructed.cash_gbp-reconstructed.pending_reserved_cash_gbp==Decimal('90000')
+
+
+def test_forged_resealed_history_needs_anchor_and_put_collateral_uses_gbp_fx():
+    forged=seal_history([{'kind':'portfolio_initialized','cash_gbp':'100000','nav_gbp':'100000','peak_nav_gbp':'100000'}])
+    with pytest.raises(ValueError,match='external anchor'):
+        portfolio_collect(ledger_source(forged))
+    fx=ingest_response(kind=EvidenceKind.FX,provider='fixture',feed='fx',request={'pair':'GBPUSD'},
+        requested_at=AT,received_at=AT+timedelta(seconds=1),raw={'fixture':True},normalized={
+            'symbol':'GBPUSD','timestamp':AT.isoformat(),'bid':'0.29','ask':'0.31','mid':'0.30'})
+    option=proposal()['operation']['instrument']; option={**option,'strike':'1000'}
+    rows=seal_history([{'kind':'portfolio_initialized','cash_gbp':'100000','nav_gbp':'100000','peak_nav_gbp':'100000'},
+        {'kind':'position','instrument':option,'quantity_delta':-1,'cost_basis_delta_gbp':'0'},
+        {'kind':'mark','instrument':option,'mark_gbp':'0'}, {'kind':'fx','evidence_packet':fx.as_json()},
+        {'kind':'valuation','nav_gbp':'100000','peak_nav_gbp':'100000'}])
+    artifact=portfolio_collect(ledger_source(rows,portfolio_artifact()),trusted_attestor=TRUSTED)
+    assert artifact['payload']['nav_gbp']=='100000' and artifact['payload']['fx_evidence']['packet_id']==fx.packet_id

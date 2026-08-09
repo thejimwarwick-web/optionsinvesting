@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
 from .mandate import DEFAULT_MANDATE
-from .market_data import EvidenceKind, EvidencePacket, assess, canonical_json, ingest_response
+from .market_data import EvidenceKind, EvidencePacket, assess, canonical_json, ingest_response, load_packet
 from .accounting import Position
 from .models import AssetType, Instrument, Observation, OptionRight, Order, OrderSubmission, ResearchCandidate, Side, TradingDecision
 from .operations import PaperRun, seal_artifact, verify_artifact
@@ -116,7 +116,7 @@ def portfolio_from_artifact(supplied, trusted_attestor=None):
 def _portfolio_payload(p):
     required={'nav_gbp','peak_nav_gbp','cash_gbp','positions','pending_submissions',
               'drawdown','source_ledger_record_ids','source_ledger_records',
-              'ledger_ancestry_sha256','initialization_mode'}
+              'ledger_ancestry_sha256','initialization_mode','fx_evidence'}
     if set(p)!=required: raise ValueError('portfolio snapshot schema mismatch')
     positions={}; marks={}
     for row in p['positions']:
@@ -147,6 +147,9 @@ def _portfolio_payload(p):
     if not isinstance(p['initialization_mode'],bool): raise ValueError('invalid initialization mode')
     if not isinstance(p['source_ledger_records'],list) or [x.get('record_id') for x in p['source_ledger_records']]!=refs: raise ValueError('ledger ancestry order mismatch')
     if p['ledger_ancestry_sha256']!=hashlib.sha256(canonical_json(p['source_ledger_records'])).hexdigest(): raise ValueError('ledger ancestry hash mismatch')
+    if p['fx_evidence'] is not None:
+        fx=load_packet(p['fx_evidence'])
+        if not fx.verify() or fx.kind is not EvidenceKind.FX or fx.normalized.get('symbol')!='GBPUSD': raise ValueError('invalid snapshot FX evidence')
     return PortfolioRisk(nav,peak,cash,positions,marks,pending_cash,pending_collateral,pending_covered)
 
 def seal_ledger_record(value, *, sequence=0, previous_record_id=""):
@@ -162,14 +165,21 @@ def _verify_ledger_record(record):
     expected=seal_ledger_record(body,sequence=body.pop('sequence',None),previous_record_id=body.pop('previous_record_id',None))
     return record==expected
 
-def portfolio_collect(source, *, initialize=False, expected_state=None):
+def portfolio_collect(source, *, initialize=False, expected_state=None, trusted_attestor=None):
     """Replay append-only paper-ledger records into a reconciled snapshot."""
-    if not isinstance(source,dict) or set(source)!={'records','record_count','head_record_id'} or not isinstance(source['records'],list): raise ValueError('paper ledger input schema mismatch')
-    records=source['records']; ids=[]; cash=Decimal('0'); peak=Decimal('0'); positions={}; marks={}; pending={}; initialized=False
+    if not isinstance(source,dict) or set(source)!={'records','record_count','head_record_id','anchor'} or not isinstance(source['records'],list): raise ValueError('paper ledger input schema mismatch')
+    records=source['records']; ids=[]; cash=Decimal('0'); peak=Decimal('0'); positions={}; marks={}; pending={}; initialized=False; fx_packet=None
     if source['record_count']!=len(records) or (records and source['head_record_id']!=records[-1].get('record_id')) or (not records and source['head_record_id']!=''):
         raise ValueError('paper ledger history is missing or has the wrong head')
+    if records:
+        if source['anchor'] is None: raise ValueError('non-bootstrap ledger history requires an external anchor')
+        anchor_envelope,anchor_local=_attested_local(source['anchor'],'portfolio_snapshot',trusted_attestor)
+        anchored=anchor_local['payload']; count=len(anchored['source_ledger_records'])
+        if count>len(records) or records[:count]!=anchored['source_ledger_records'] or anchored['source_ledger_record_ids'][-1]!=records[count-1]['record_id']:
+            raise ValueError('ledger history does not continue its externally anchored head')
+    elif source['anchor'] is not None: raise ValueError('empty initialization cannot replace an anchored ledger')
     def marked_nav():
-        value=cash-sum((Decimal(x['reserved_cash_gbp']) for x in pending.values()),Decimal('0'))
+        value=cash
         for instrument,row in positions.items(): value+=Decimal(row['quantity'])*instrument.multiplier*marks.get(instrument,Decimal('0'))
         return value
     previous=""
@@ -183,7 +193,7 @@ def portfolio_collect(source, *, initialize=False, expected_state=None):
             'cash':common|{'amount_gbp'},'position':common|{'instrument','quantity_delta','cost_basis_delta_gbp'},
             'mark':common|{'instrument','mark_gbp'},'pending_submission':common|{'submission'},
             'submission_resolved':common|{'submission_artifact_id'},
-            'valuation':common|{'nav_gbp','peak_nav_gbp'}}
+            'valuation':common|{'nav_gbp','peak_nav_gbp'},'fx':common|{'evidence_packet'}}
         if kind not in schemas or set(record)!=schemas[kind]: raise ValueError('paper ledger record schema mismatch')
         if kind=='portfolio_initialized':
             if initialized or record.get('cash_gbp')!='100000' or record.get('nav_gbp')!='100000' or record.get('peak_nav_gbp')!='100000': raise ValueError('invalid portfolio initialization record')
@@ -217,6 +227,10 @@ def portfolio_collect(source, *, initialize=False, expected_state=None):
             if stated!=computed: raise ValueError('valuation NAV disagrees with reconstructed state')
             peak=max(peak,computed)
             if stated_peak!=peak: raise ValueError('valuation peak NAV disagrees with reconstructed state')
+        elif kind=='fx':
+            candidate=load_packet(record['evidence_packet'])
+            if not candidate.verify() or candidate.kind is not EvidenceKind.FX or candidate.normalized.get('symbol')!='GBPUSD': raise ValueError('sealed GBP/USD FX evidence required')
+            fx_packet=candidate
     if not records:
         if not initialize: raise ValueError('empty ledger requires explicit initialization mode')
         bootstrap=seal_ledger_record({'kind':'portfolio_initialized','cash_gbp':'100000','nav_gbp':'100000','peak_nav_gbp':'100000'},sequence=0,previous_record_id='')
@@ -236,6 +250,9 @@ def portfolio_collect(source, *, initialize=False, expected_state=None):
             else: raise ValueError('invalid short option position')
         elif row['quantity']>0 and instrument.asset_type is AssetType.OPTION:
             raise ValueError('long option position prohibited by mandate')
+    if put_collateral:
+        if fx_packet is None: raise ValueError('sealed GBP/USD FX evidence required for put collateral')
+        put_collateral*=Decimal(str(fx_packet.normalized['mid']))
     if put_collateral>cash: raise ValueError('unsecured short put in ledger')
     if put_collateral+sum(Decimal(x['reserved_collateral_gbp']) for x in pending.values())>marked_nav()*DEFAULT_MANDATE.csp_collateral_limit:
         raise ValueError('cash-secured-put collateral limit exceeded in ledger')
@@ -250,7 +267,8 @@ def portfolio_collect(source, *, initialize=False, expected_state=None):
     payload={'nav_gbp':str(nav),'peak_nav_gbp':str(peak),'cash_gbp':str(cash),'positions':list(positions.values()),
         'pending_submissions':list(pending.values()),'drawdown':str(max(Decimal('0'),(peak-nav)/peak)),
         'source_ledger_record_ids':ids,'source_ledger_records':records,
-        'ledger_ancestry_sha256':hashlib.sha256(canonical_json(records)).hexdigest(),'initialization_mode':initialization_mode}
+        'ledger_ancestry_sha256':hashlib.sha256(canonical_json(records)).hexdigest(),'initialization_mode':initialization_mode,
+        'fx_evidence':fx_packet.as_json() if fx_packet else None}
     _portfolio_payload(payload)
     if expected_state is not None and canonical_json(expected_state)!=canonical_json(payload): raise ValueError('supplied state disagrees with reconstructed ledger state')
     return seal_artifact('portfolio_snapshot',payload)
