@@ -6,6 +6,7 @@ from datetime import datetime
 import hashlib
 import json
 import os
+import threading
 from urllib.parse import quote, urlencode, urlsplit
 from typing import Any, Iterable, Mapping, Protocol, Sequence
 
@@ -246,6 +247,7 @@ def production_trusted_attestor_factory(environ: Mapping[str, str] | None = None
 
 
 class SheetAttestationBoundary:
+    _portfolio_lock = threading.Lock()
     def __init__(self, port: AppendOnlySheetPort, external_system="google-sheets",
                  provenance="disconnected-fixture"):
         self.port, self.external_system, self.provenance = port, external_system, provenance
@@ -277,6 +279,24 @@ class SheetAttestationBoundary:
         receipt,exact=pair
         return create_attested_artifact(artifact,receipt,exact,parents=parents,
                                         trusted_attestor=trusted_attestor)
+
+    def append_portfolio_envelope(self, artifact, at, *, trusted_attestor=None, environ=None):
+        """Compare-and-verify the canonical portfolio head around an append."""
+        expected=artifact.get('payload',{}).get('anchor_artifact_id')
+        with self._portfolio_lock:
+            before=[json.loads(SheetRecord.from_row(row).payload_json) for row in self.port.read_all()]
+            portfolios=[x for x in before if x.get('artifact_kind')=='portfolio_snapshot']
+            latest=portfolios[-1]['artifact_id'] if portfolios else None
+            if latest==artifact.get('artifact_id'):
+                return self.append_envelope(artifact,at,trusted_attestor=trusted_attestor,environ=environ)
+            if latest!=expected: raise ValueError('portfolio anchor is stale or not the latest canonical head')
+            envelope=self.append_envelope(artifact,at,trusted_attestor=trusted_attestor,environ=environ)
+            after=[json.loads(SheetRecord.from_row(row).payload_json) for row in self.port.read_all()]
+            children=[x for x in after if x.get('artifact_kind')=='portfolio_snapshot'
+                and x.get('payload',{}).get('anchor_artifact_id')==expected]
+            if len(children)!=1 or children[0].get('artifact_id')!=artifact.get('artifact_id'):
+                raise ValueError('competing portfolio continuation detected')
+            return envelope
 
     def read_back(self, record: SheetRecord, location: str, at: datetime) -> tuple[AttestationReceipt, Mapping[str, Any]]:
         require_utc(at, "read_back_at")

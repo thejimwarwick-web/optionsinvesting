@@ -71,6 +71,10 @@ def portfolio_artifact():
     artifact=portfolio_collect(ledger_source([]),initialize=True)
     return attest(artifact).as_json()
 
+def portfolio_anchor(boundary):
+    artifact=portfolio_collect(ledger_source([]),initialize=True)
+    return boundary.append_portfolio_envelope(artifact,AT,trusted_attestor=TRUSTED).as_json()
+
 
 def seal_history(rows):
     result=[]
@@ -237,8 +241,8 @@ def test_portfolio_collect_replays_nonempty_ledger_and_rejects_disagreement(tmp_
         {'record_id':'cash-1','kind':'cash','amount_gbp':'-1000'},
         {'record_id':'position-1','kind':'position','instrument':equity,'quantity_delta':10,'cost_basis_delta_gbp':'1000'},
         {'record_id':'mark-1','kind':'mark','instrument':equity,'mark_gbp':'110'},
-        {'record_id':'valuation-1','kind':'valuation','nav_gbp':'100100','peak_nav_gbp':'100100'}]}
-    ledger=ledger_source(seal_history(ledger['records']),portfolio_artifact())
+        {'record_id':'valuation-1','kind':'valuation','nav_gbp':'100100','peak_nav_gbp':'100100','valued_at':(AT+timedelta(seconds=2)).isoformat()}]}
+    ledger=ledger_source(seal_history(ledger['records']),portfolio_anchor(boundary))
     source=tmp_path/'ledger.json'; output=tmp_path/'portfolio.json'; write(source,ledger)
     clock=TickClock(AT)
     assert main(['portfolio-collect',str(source),'--output',str(output)],utc_clock=clock,
@@ -266,7 +270,7 @@ def test_ledger_replay_rejects_falsified_nav_negative_shares_and_cost_basis():
         'right':None,'multiplier':1,'adjusted':False,'occ_verified':True}
     init={'kind':'portfolio_initialized','cash_gbp':'100000','nav_gbp':'100000','peak_nav_gbp':'100000'}
     cases=[
-        [init,{'kind':'valuation','nav_gbp':'99999','peak_nav_gbp':'100000'}],
+        [init,{'kind':'valuation','nav_gbp':'99999','peak_nav_gbp':'100000','valued_at':(AT+timedelta(seconds=2)).isoformat()}],
         [init,{'kind':'position','instrument':equity,'quantity_delta':-1,'cost_basis_delta_gbp':'0'}],
         [init,{'kind':'position','instrument':equity,'quantity_delta':1,'cost_basis_delta_gbp':'-1'}]]
     for rows in cases:
@@ -295,7 +299,7 @@ def test_pending_reservation_reduces_free_cash_not_nav_or_drawdown():
         'reserved_cash_gbp':'10000','reserved_collateral_gbp':'2000','covered_shares':0,'submission_artifact_id':'pending-1'}
     rows=seal_history([{'kind':'portfolio_initialized','cash_gbp':'100000','nav_gbp':'100000','peak_nav_gbp':'100000'},
         {'kind':'pending_submission','submission':submission},
-        {'kind':'valuation','nav_gbp':'100000','peak_nav_gbp':'100000'}])
+        {'kind':'valuation','nav_gbp':'100000','peak_nav_gbp':'100000','valued_at':(AT+timedelta(seconds=2)).isoformat()}])
     artifact=portfolio_collect(ledger_source(rows,portfolio_artifact()),trusted_attestor=TRUSTED)
     payload=artifact['payload']; assert payload['nav_gbp']=='100000' and payload['drawdown']=='0'
     envelope=attest(artifact); reconstructed=__import__('value_options.workflow',fromlist=['portfolio_from_artifact']).portfolio_from_artifact(envelope,TRUSTED)
@@ -308,11 +312,42 @@ def test_forged_resealed_history_needs_anchor_and_put_collateral_uses_gbp_fx():
         portfolio_collect(ledger_source(forged))
     fx=ingest_response(kind=EvidenceKind.FX,provider='fixture',feed='fx',request={'pair':'GBPUSD'},
         requested_at=AT,received_at=AT+timedelta(seconds=1),raw={'fixture':True},normalized={
-            'symbol':'GBPUSD','timestamp':AT.isoformat(),'bid':'0.29','ask':'0.31','mid':'0.30'})
-    option=proposal()['operation']['instrument']; option={**option,'strike':'1000'}
+            'symbol':'GBPUSD','timestamp':AT.isoformat(),'bid':'1.29','ask':'1.31','mid':'1.30'})
+    option=proposal()['operation']['instrument']; option={**option,'strike':'500'}
     rows=seal_history([{'kind':'portfolio_initialized','cash_gbp':'100000','nav_gbp':'100000','peak_nav_gbp':'100000'},
         {'kind':'position','instrument':option,'quantity_delta':-1,'cost_basis_delta_gbp':'0'},
         {'kind':'mark','instrument':option,'mark_gbp':'0'}, {'kind':'fx','evidence_packet':fx.as_json()},
-        {'kind':'valuation','nav_gbp':'100000','peak_nav_gbp':'100000'}])
+        {'kind':'valuation','nav_gbp':'100000','peak_nav_gbp':'100000','valued_at':(AT+timedelta(seconds=2)).isoformat()}])
     artifact=portfolio_collect(ledger_source(rows,portfolio_artifact()),trusted_attestor=TRUSTED)
     assert artifact['payload']['nav_gbp']=='100000' and artifact['payload']['fx_evidence']['packet_id']==fx.packet_id
+
+
+@pytest.mark.parametrize('normalized',[{
+    'symbol':'GBPUSD','timestamp':(AT-timedelta(minutes=10)).isoformat(),'bid':'1.29','ask':'1.31','mid':'1.30'},
+    {'symbol':'GBPUSD','timestamp':AT.isoformat(),'ask':'1.31','mid':'1.30'}])
+def test_put_collateral_rejects_stale_or_malformed_fx(normalized):
+    fx=ingest_response(kind=EvidenceKind.FX,provider='fixture',feed='fx',request={'pair':'GBPUSD'},
+        requested_at=AT-timedelta(minutes=11),received_at=AT-timedelta(minutes=9),raw={'fixture':True},normalized=normalized)
+    option={**proposal()['operation']['instrument'],'strike':'500'}
+    rows=seal_history([{'kind':'portfolio_initialized','cash_gbp':'100000','nav_gbp':'100000','peak_nav_gbp':'100000'},
+        {'kind':'position','instrument':option,'quantity_delta':-1,'cost_basis_delta_gbp':'0'},
+        {'kind':'mark','instrument':option,'mark_gbp':'0'},{'kind':'fx','evidence_packet':fx.as_json()},
+        {'kind':'valuation','nav_gbp':'100000','peak_nav_gbp':'100000','valued_at':(AT+timedelta(seconds=2)).isoformat()}])
+    with pytest.raises(ValueError,match='FX evidence'):
+        portfolio_collect(ledger_source(rows,portfolio_artifact()),trusted_attestor=TRUSTED)
+
+
+def test_portfolio_head_rejects_rollback_and_competing_branch(tmp_path):
+    boundary=SheetAttestationBoundary(MemorySheet(),provenance='test-authenticated'); anchor=portfolio_anchor(boundary)
+    base=anchor['original_artifact']['payload']['source_ledger_records']
+    def branch(amount):
+        record=seal_ledger_record({'kind':'cash','amount_gbp':amount},sequence=1,
+            previous_record_id=base[-1]['record_id'])
+        return ledger_source([*base,record],anchor)
+    clock=TickClock(AT); first_in=tmp_path/'first.json'; first_out=tmp_path/'first-out.json'; write(first_in,branch('-1'))
+    assert main(['portfolio-collect',str(first_in),'--output',str(first_out)],utc_clock=clock,
+        sheet_boundary=boundary,trusted_attestor=TRUSTED)==0
+    second_in=tmp_path/'second.json'; rejected=tmp_path/'rejected.json'; write(second_in,branch('-2'))
+    assert main(['portfolio-collect',str(second_in),'--output',str(rejected)],utc_clock=clock,
+        sheet_boundary=boundary,trusted_attestor=TRUSTED)==1
+    assert 'latest canonical head' in ' '.join(json.loads(rejected.read_text())['reasons'])

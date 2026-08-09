@@ -127,7 +127,7 @@ def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary
                         prior=json.loads(SheetRecord.from_row(row).payload_json)
                         if prior.get('artifact_kind')=='portfolio_snapshot':
                             raise ValueError('portfolio initialization already exists in append-only ledger')
-                local=portfolio_collect(inputs[0],initialize=args.initialize,expected_state=inputs[1],trusted_attestor=trusted_attestor); envelope=sheet_boundary.append_envelope(local,utc_clock(),trusted_attestor=trusted_attestor)
+                local=portfolio_collect(inputs[0],initialize=args.initialize,expected_state=inputs[1],trusted_attestor=trusted_attestor); envelope=sheet_boundary.append_portfolio_envelope(local,utc_clock(),trusted_attestor=trusted_attestor)
             elif args.command=='research-collect':
                 local=research_collect(inputs[0],collection_providers,utc_clock); envelope=sheet_boundary.append_envelope(local,utc_clock(),trusted_attestor=trusted_attestor)
             elif args.command=='decision-collect':
