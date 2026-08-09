@@ -2,7 +2,11 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
@@ -262,3 +266,71 @@ def test_provider_and_oauth_failures_are_sanitized():
     with pytest.raises(ExternalServiceError) as caught:
         oauth("https://oauth2.googleapis.com/token",method="POST")
     assert secret not in str(caught.value)
+
+
+def test_live_preflight_external_failure_is_subprocess_quarantine_without_traceback():
+    script=textwrap.dedent("""
+        import value_options.broker as broker
+        from value_options.cli import main
+        from value_options.http import ExternalServiceError
+        class FailedAlpaca:
+            def __init__(self): pass
+            def clock(self): raise ExternalServiceError('sanitized provider failure')
+        broker.AlpacaReadOnlyClient=FailedAlpaca
+        raise SystemExit(main(['preflight','--live-read-only']))
+    """)
+    env={**os.environ,
+        "ALPACA_API_KEY_ID":"fixture-key","ALPACA_API_SECRET_KEY":"fixture-secret",
+        "GOOGLE_SHEETS_SPREADSHEET_ID":"fixture-sheet","GOOGLE_SERVICE_ACCOUNT_JSON":"{}",
+        "VALUE_OPTIONS_ENABLE_LIVE_READ_ONLY":"I_UNDERSTAND_READ_ONLY_NETWORK_ACCESS",
+        "PYTHONPATH":str(Path(__file__).parents[1]/"src")}
+    result=subprocess.run([sys.executable,"-c",script],cwd=Path(__file__).parents[1],env=env,
+        text=True,capture_output=True,timeout=10)
+    assert result.returncode==2 and "reasons=1" in result.stdout
+    assert "Traceback" not in result.stderr and "fixture-secret" not in result.stdout+result.stderr
+
+
+def test_unexpected_json_structures_fail_closed_in_subprocess():
+    script=textwrap.dedent("""
+        from value_options.broker import AlpacaReadOnlyClient
+        from value_options.http import ExternalServiceError, HttpResponse
+        from value_options.sheets import GoogleSheetsAdapter
+        class Fake:
+            def __init__(self,response): self.response=response
+            def request(self,*args,**kwargs): return self.response
+        alpaca=AlpacaReadOnlyClient(transport=Fake(HttpResponse(200,{'x-request-id':'r'},b'[]',
+            'https://paper-api.alpaca.markets/v2/clock')),environ={
+            'ALPACA_API_KEY_ID':'x','ALPACA_API_SECRET_KEY':'y'})
+        google=GoogleSheetsAdapter(token_provider=lambda:'token',transport=Fake(HttpResponse(200,{},b'[]',
+            'https://sheets.googleapis.com/v4/spreadsheets/s/values/Attestations%21A%3AG')),
+            environ={'GOOGLE_SHEETS_SPREADSHEET_ID':'s','GOOGLE_SERVICE_ACCOUNT_JSON':'{}'})
+        for operation in (alpaca.clock,google.read_all):
+            try: operation()
+            except ExternalServiceError: pass
+            else: raise AssertionError('unexpected JSON structure was accepted')
+        print('fail-closed')
+    """)
+    env={**os.environ,"PYTHONPATH":str(Path(__file__).parents[1]/"src")}
+    result=subprocess.run([sys.executable,"-c",script],cwd=Path(__file__).parents[1],env=env,
+        text=True,capture_output=True,timeout=10)
+    assert result.returncode==0 and result.stdout.strip()=="fail-closed" and not result.stderr
+
+
+@pytest.mark.parametrize(("endpoint","body","url"),[
+    ("underlying",b'{"quote":[]}',"https://data.alpaca.markets/v2/stocks/IBM/quotes/latest"),
+    ("option",b'{"quotes":{"IBM":[]}}',"https://data.alpaca.markets/v1beta1/options/quotes/latest?symbols=IBM&feed=opra"),
+])
+def test_nested_alpaca_response_structures_fail_closed(endpoint,body,url):
+    client=AlpacaReadOnlyClient(transport=FakeHttp(HttpResponse(200,{"x-request-id":"r"},body,url)),
+        environ={"ALPACA_API_KEY_ID":"x","ALPACA_API_SECRET_KEY":"y"})
+    with pytest.raises(ExternalServiceError,match="unexpected response structure"):
+        client.underlying_quote("IBM") if endpoint=="underlying" else client.option_quote("IBM")
+
+
+@pytest.mark.parametrize("body",[b'{"values":{}}',b'{"values":[{}]}'])
+def test_nested_google_values_structures_fail_closed(body):
+    adapter=GoogleSheetsAdapter(token_provider=lambda:"token",transport=FakeHttp(HttpResponse(200,{},body,
+        "https://sheets.googleapis.com/v4/spreadsheets/s/values/Attestations%21A%3AG")),environ={
+        "GOOGLE_SHEETS_SPREADSHEET_ID":"s","GOOGLE_SERVICE_ACCOUNT_JSON":"{}"})
+    with pytest.raises(ExternalServiceError,match="unexpected response structure"):
+        adapter.read_all()

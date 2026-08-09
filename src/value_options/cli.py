@@ -15,6 +15,7 @@ from .market_data import canonical_json
 import hashlib
 from .risk import PortfolioRisk
 from .config import live_read_only_enabled, preflight, redact
+from .http import ExternalServiceError
 
 
 def _time(value): return datetime.fromisoformat(value).astimezone(timezone.utc)
@@ -132,7 +133,7 @@ def main(argv=None):
             artifact=seal_artifact("fill",fill)
         else:
             report=run.excluded_replay(_packets(args.bundle),as_of=_time(args.as_of)); artifact={"mode":"replay",**report.jsonable()}
-    except (KeyError,TypeError,ValueError,ArithmeticError) as error:
+    except (KeyError,TypeError,ValueError,ArithmeticError,ExternalServiceError) as error:
         artifact=_quarantine(args.command,[redact(str(error)) or error.__class__.__name__])
     artifact.update({"classification":"PAPER ONLY","order_policy":"NO LIVE ORDER"})
     output=getattr(args,"output",None)

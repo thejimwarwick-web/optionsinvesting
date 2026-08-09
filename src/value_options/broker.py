@@ -90,6 +90,7 @@ class AlpacaReadOnlyClient:
         try: raw = json.loads(response.body)
         except (TypeError, json.JSONDecodeError, UnicodeDecodeError):
             raise ExternalServiceError("Alpaca returned an invalid response") from None
+        _validate_response_structure(endpoint, raw)
         now = datetime.now(timezone.utc)
         timestamp = _provider_timestamp(endpoint, raw)
         request_id = response.headers.get("x-request-id") or response.headers.get("X-Request-ID")
@@ -119,6 +120,24 @@ def _provider_timestamp(endpoint, value):
                 if parsed.tzinfo is not None: return parsed.astimezone(timezone.utc)
             except (TypeError, ValueError): pass
     return None
+
+
+def _validate_response_structure(endpoint, value):
+    """Validate only the documented containers used by supported endpoints."""
+    valid = False
+    if endpoint == "calendar":
+        valid = isinstance(value, list) and all(isinstance(day, Mapping) for day in value)
+    elif endpoint == "clock": valid = isinstance(value, Mapping)
+    elif endpoint == "underlying_quote":
+        valid = isinstance(value, Mapping) and isinstance(value.get("quote"), Mapping)
+    elif endpoint == "option_quote":
+        valid = isinstance(value, Mapping) and isinstance(value.get("quotes"), Mapping) and \
+            all(isinstance(quote, Mapping) for quote in value["quotes"].values())
+    elif endpoint == "option_chain":
+        valid = isinstance(value, Mapping) and isinstance(value.get("snapshots"), Mapping) and all(
+            isinstance(snapshot, Mapping) and (snapshot.get("latestQuote") is None or
+                isinstance(snapshot.get("latestQuote"), Mapping)) for snapshot in value["snapshots"].values())
+    if not valid: raise ExternalServiceError("Alpaca returned an unexpected response structure")
 
 
 def _symbol(value):

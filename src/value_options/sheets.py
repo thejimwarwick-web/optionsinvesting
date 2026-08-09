@@ -112,31 +112,51 @@ class GoogleSheetsAdapter:
         if final.scheme != "https" or final.hostname != self.HOST or 300 <= response.status < 400:
             raise ValueError("Google redirect or unapproved response host")
         if response.status < 200 or response.status >= 300: raise ValueError(f"Google Sheets failed with HTTP {response.status}")
-        try: return json.loads(response.body or b"{}")
+        try: result = json.loads(response.body or b"{}")
         except (TypeError, json.JSONDecodeError, UnicodeDecodeError):
             raise ExternalServiceError("Google API returned an invalid response") from None
+        if not isinstance(result, Mapping):
+            raise ExternalServiceError("Google API returned an unexpected response structure")
+        return result
 
     def append_row(self, row):
+        expected = normalize_values_row(row)
         result = self._request("POST", ":append", body={"majorDimension": "ROWS", "values": [list(row)]},
             query={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS", "includeValuesInResponse": "true"})
         updates = result.get("updates", {})
+        if not isinstance(updates, Mapping) or not isinstance(updates.get("updatedData"), Mapping):
+            raise ExternalServiceError("Google append returned an unexpected response structure")
         echoed = updates.get("updatedData", {}).get("values")
-        if updates.get("updatedRows") != 1 or not isinstance(echoed, list) or len(echoed) != 1 or \
-                normalize_values_row(echoed[0]) != normalize_values_row(row):
+        if updates.get("updatedRows") != 1 or not isinstance(echoed, list) or len(echoed) != 1:
+            raise ExternalServiceError("Google append returned an unexpected response structure")
+        if self._provider_row(echoed[0]) != expected:
             raise ValueError("Google append response did not exactly echo one row")
         location = updates.get("updatedRange", "")
         if not location: raise ValueError("Google append omitted updated range")
         return location
 
     def read_row(self, immutable_location):
-        rows = self._request("GET", "", value_range=immutable_location).get("values", [])
+        rows = self._values(self._request("GET", "", value_range=immutable_location))
         if len(rows) != 1: raise ValueError("expected exactly one Google row")
-        return normalize_values_row(rows[0])
+        return self._provider_row(rows[0])
 
     def read_all(self):
-        rows = [normalize_values_row(row) for row in self._request("GET", "").get("values", ())]
+        rows = [self._provider_row(row) for row in self._values(self._request("GET", ""))]
         if rows and tuple(rows[0]) == HEADERS: rows.pop(0)
         return tuple(tuple(row) for row in rows)
+
+    @staticmethod
+    def _values(result):
+        rows = result.get("values", [])
+        if not isinstance(rows, list) or any(not isinstance(row, list) for row in rows):
+            raise ExternalServiceError("Google values returned an unexpected response structure")
+        return rows
+
+    @staticmethod
+    def _provider_row(row):
+        try: return normalize_values_row(row)
+        except (TypeError, ValueError):
+            raise ExternalServiceError("Google values returned an unexpected response structure") from None
 
 
 def google_service_account_token_provider(environ: Mapping[str, str] | None = None):
