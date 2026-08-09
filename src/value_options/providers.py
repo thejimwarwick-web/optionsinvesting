@@ -30,14 +30,19 @@ class ProductionCollectionProviders:
             q=raw['quote']; n={'timestamp':q['t'],'symbol':raw.get('symbol'),'bid':q['bp'],'ask':q['ap'],'bid_size':q['bs'],'ask_size':q['as']}
         elif kind=='option_chain':
             contracts=[]; timestamps=[]
-            pages=raw.get('pages',[raw]); snapshots={}
-            for page in pages: snapshots.update(page['snapshots'])
+            pages=raw.get('pages'); snapshots={}
+            if pages:
+                for page in pages: snapshots.update(page['raw']['snapshots'])
+            else: snapshots.update(raw['snapshots'])
             for symbol,snapshot in snapshots.items():
-                details=snapshot.get('details') or {}; quote=snapshot.get('latestQuote') or {}
+                quote=snapshot.get('latestQuote') or {}; match=re.fullmatch(r'([A-Z.]+)(\d{6})([CP])(\d{8})',symbol)
+                if not match: raise ExternalServiceError('option chain contains a non-OCC contract')
+                underlying,date,right,strike=match.groups()
                 timestamps.append(quote.get('t'))
-                contracts.append({'symbol':symbol,'underlying':details.get('underlying_symbol'),
-                    'expiration':details.get('expiration_date'),'strike':str(details.get('strike_price')),
-                    'right':details.get('type'),'multiplier':int(details.get('size',100))})
+                contracts.append({'symbol':symbol,'underlying':underlying,
+                    'expiration':f'20{date[:2]}-{date[2:4]}-{date[4:]}',
+                    'strike':str(int(strike)/1000).rstrip('0').rstrip('.'),
+                    'right':'call' if right=='C' else 'put','multiplier':100})
             n={'timestamp':max(x for x in timestamps if x),'contracts':contracts}
         else:
             if len(raw['quotes'])!=1: raise ExternalServiceError('exact option quote response required')
@@ -57,7 +62,8 @@ class ProductionCollectionProviders:
     def option_quote(self,symbol): return self._alpaca(self.alpaca.option_quote(symbol),'option_quote')
     def _aux(self,name,parameter):
         host,path=AUX_ENDPOINTS[name]
-        query=({'symbols':parameter,'types':'cash_dividend' if name=='dividend' else 'all','limit':1000,'sort':'asc'}
+        coverage=datetime.now(timezone.utc).date().isoformat()
+        query=({'symbols':parameter,'types':'cash_dividend' if name=='dividend' else 'merger,spinoff,split','start':coverage,'end':coverage,'limit':1000,'sort':'asc'}
                if name!='fx' else {'symbols':parameter})
         url=f'https://{host}{path}?{urlencode(query)}'
         response=self.transport.request('GET',url,headers={'Accept':'application/json',
@@ -75,10 +81,17 @@ class ProductionCollectionProviders:
             rows=raw.get('corporate_actions') if isinstance(raw,Mapping) else None
             if not isinstance(rows,list): raise ExternalServiceError(name+' evidence response malformed')
             matched=[x for x in rows if isinstance(x,Mapping) and x.get('symbol')==parameter]
-            if not matched: raise ExternalServiceError(name+' evidence response mismatched request')
-            latest=max(matched,key=lambda x:x.get('updated_at','')); normalized={'symbol':parameter,
-                'timestamp':latest.get('updated_at'),'retrieved_at':latest.get('updated_at'),
-                'effective_date':latest.get('ex_date') or latest.get('effective_date'),'records':matched}
+            if not matched and rows: raise ExternalServiceError(name+' evidence response mismatched request')
+            if not matched:
+                if raw.get('symbol')!=parameter or raw.get('start')!=coverage or raw.get('end')!=coverage or not raw.get('as_of'):
+                    raise ExternalServiceError(name+' negative evidence lacks authenticated coverage')
+                normalized={'symbol':parameter,'timestamp':raw['as_of'],'retrieved_at':raw['as_of'],
+                    'effective_date':coverage,'coverage_start':coverage,'coverage_end':coverage,'records':[],'negative_evidence':True}
+            else:
+                latest=max(matched,key=lambda x:x.get('updated_at','')); normalized={'symbol':parameter,
+                    'timestamp':latest.get('updated_at'),'retrieved_at':latest.get('updated_at'),
+                    'effective_date':latest.get('ex_date') or latest.get('effective_date'),
+                    'coverage_start':coverage,'coverage_end':coverage,'records':matched,'negative_evidence':False}
         return ReadResult('alpaca',str(raw.get('feed',name)),raw,normalized)
     def corporate_action(self,underlying): return self._aux('corporate_action',underlying)
     def dividend(self,underlying): return self._aux('dividend',underlying)

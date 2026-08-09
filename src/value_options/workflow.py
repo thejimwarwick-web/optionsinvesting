@@ -107,6 +107,9 @@ def portfolio_from_artifact(supplied, trusted_attestor=None):
     checked=verify_attested_artifact(envelope,trusted_attestor=trusted_attestor)
     if not checked.verified or not checked.launch_eligible: raise ValueError('trusted externally attested portfolio snapshot required')
     artifact=envelope.original_artifact; p=artifact['payload']
+    return _portfolio_payload(p)
+
+def _portfolio_payload(p):
     if set(p)!={'nav_gbp','peak_nav_gbp','cash_gbp','positions','pending_submissions'}: raise ValueError('portfolio snapshot schema mismatch')
     positions={}; marks={}
     for row in p['positions']:
@@ -129,6 +132,11 @@ def portfolio_from_artifact(supplied, trusted_attestor=None):
     nav,peak,cash=Decimal(p['nav_gbp']),Decimal(p['peak_nav_gbp']),Decimal(p['cash_gbp'])
     if any(not x.is_finite() or x<0 for x in (nav,peak,cash)) or nav==0 or peak<nav: raise ValueError('invalid portfolio cash or NAV')
     return PortfolioRisk(nav,peak,cash,positions,marks,pending_cash,pending_collateral,pending_covered)
+
+def portfolio_collect(source):
+    """Validate and seal a portfolio snapshot before external append/read-back."""
+    _portfolio_payload(source)
+    return seal_artifact('portfolio_snapshot',source)
 def _evidence_refs(packets): return [{'name':p.kind.value,'value':p.packet_id,'available_at':p.received_at.isoformat(),'request_started_at':p.requested_at.isoformat(),'provider_observed_at':p.normalized.get('timestamp')} for p in packets]
 
 def research_collect(source,providers,clock):

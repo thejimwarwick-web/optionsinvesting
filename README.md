@@ -222,7 +222,7 @@ Those four commands remain historical/file-driven and retain caller-supplied
 timestamps. They are never used by prospective collection. In contrast, the
 three `*-collect` commands expose no `--at`, `--submitted-at`, or `--as-of` option:
 an injected UTC clock supplies request, observation, receipt, decision,
-submission, read-back, and fill times. Sheet evidence is written to a separate `--attestation-output`, never added to a sealed artifact. Atomic checkpoint files make completed
+submission, read-back, and fill times. Each prospective output is a complete immutable `AttestedArtifact` envelope; decision and submission are persisted separately with their exact parent chains. Atomic checkpoint files make completed
 provider work idempotent across restarts. If a Sheet append was interrupted after
 the external write, recovery locates and exactly reads back the existing row
 instead of appending another.
@@ -230,6 +230,7 @@ instead of appending another.
 ```bash
 value-options workflow-preflight                         # configuration only
 value-options workflow-preflight --live-read-only       # activated provider/schema reads
+value-options portfolio-collect portfolio-snapshot-input.json --output artifacts/portfolio-snapshot.json
 value-options research-collect research-input.json --output artifacts/research.json --checkpoint state/research.json
 value-options decision-collect artifacts/research.json artifacts/portfolio-snapshot.json proposed-operation.json --decision-output artifacts/decision.json --submission-output artifacts/submission.json --checkpoint state/decision.json
 value-options fill-collect artifacts/research.json artifacts/portfolio-snapshot.json artifacts/decision.json artifacts/submission.json --output artifacts/fill.json --checkpoint state/fill.json
@@ -243,7 +244,7 @@ calendar, and every underlying quote through injected read-only provider ports. 
 explicit corporate-action, dividend, and GBP/USD provider ports, deterministic traversal of every option-chain page token, and the
 mandate/risk engine, then seals decision separately before simulated
 submission. Fill re-verifies all ancestors and fetches a new exact-contract OPRA quote itself,
-observed and received after submission; buys use ask and sells use bid.
+observed and received after submission; buys use ask and sells use bid. Corporate-action and dividend collection accepts authenticated empty results only when they explicitly bind the requested symbol and coverage dates.
 
 Operational commands exit non-zero whenever a research, decision, submission, or
 fill stage is quarantined, invalid, or non-actionable, so schedulers cannot mistake

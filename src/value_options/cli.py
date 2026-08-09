@@ -84,6 +84,7 @@ def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary
     parser=argparse.ArgumentParser(prog="value-options",allow_abbrev=False); sub=parser.add_subparsers(dest="command",required=True)
     i=sub.add_parser("inspect"); i.add_argument("packet",type=Path); i.add_argument("--as-of",required=True); i.add_argument("--output",type=Path,required=True)
     r=sub.add_parser("research-run"); r.add_argument("input",type=Path); r.add_argument("--at",required=True); r.add_argument("--output",type=Path,required=True)
+    pc=sub.add_parser("portfolio-collect",allow_abbrev=False); pc.add_argument("input",type=Path); pc.add_argument("--output",type=Path,required=True); pc.add_argument("--checkpoint",type=Path)
     rc=sub.add_parser("research-collect",allow_abbrev=False); rc.add_argument("input",type=Path); rc.add_argument("--output",type=Path,required=True); rc.add_argument("--checkpoint",type=Path); rc.add_argument("--attestation-output",type=Path)
     d=sub.add_parser("decision-run"); d.add_argument("research",type=Path); d.add_argument("bundle",type=Path); d.add_argument("--at",required=True); d.add_argument("--submitted-at",required=True); d.add_argument("--decision-output",type=Path,required=True); d.add_argument("--submission-output",type=Path,required=True)
     dc=sub.add_parser("decision-collect",allow_abbrev=False); dc.add_argument("research",type=Path); dc.add_argument("portfolio",type=Path); dc.add_argument("proposal",type=Path); dc.add_argument("--decision-output",type=Path,required=True); dc.add_argument("--submission-output",type=Path,required=True); dc.add_argument("--checkpoint",type=Path); dc.add_argument("--attestation-output",type=Path)
@@ -95,71 +96,48 @@ def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary
     wpf=sub.add_parser("workflow-preflight"); wpf.add_argument("--live-read-only",action="store_true")
     args=parser.parse_args(argv); run=_run(); artifact=None
     try:
-        if args.command in {"research-collect","decision-collect","fill-collect"}:
-            if collection_providers is None:
-                from .providers import production_provider_factory
-                collection_providers=production_provider_factory()
-            if utc_clock is None:
-                utc_clock=lambda: datetime.now(timezone.utc)
-            if args.command in {"decision-collect","fill-collect"} and trusted_attestor is None:
-                from .sheets import production_trusted_attestor_factory
-                trusted_attestor=production_trusted_attestor_factory()
-            from .workflow import (AtomicCheckpoint, decision_collect, fill_collect,
-                                   research_collect)
-            inputs=[_read(args.input)] if args.command=="research-collect" else (
-                [_read(args.research),_read(args.portfolio),_read(args.proposal)] if args.command=="decision-collect" else
-                [_read(args.research),_read(args.portfolio),_read(args.decision),_read(args.submission)])
-            parent_ids=[x.get("artifact_id") for x in inputs if isinstance(x,dict) and x.get("artifact_id")]
-            bindings={"command_kind":args.command,"canonical_input_hash":hashlib.sha256(canonical_json(inputs)).hexdigest(),
-                "parent_artifact_ids":parent_ids,"mandate_version":DEFAULT_MANDATE.version,"provider_policy_version":"read-only-v1"}
-            checkpoint=AtomicCheckpoint(args.checkpoint,bindings) if args.checkpoint else None
-            recovered=checkpoint.read() if checkpoint else {}
-            if recovered.get("complete"):
-                artifact=recovered["artifact"]
-                expected={"research-collect":"research","decision-collect":"submission","fill-collect":"fill"}[args.command]
-                valid,reasons=verify_artifact(artifact,expected)
-                if not valid: raise ValueError("recovered checkpoint artifact invalid: "+"; ".join(reasons))
-                for envelope in recovered.get("attestations",[]):
-                    body={k:envelope[k] for k in ("record_id","immutable_location","receipt","exact_read_back","appended")}
-                    if envelope.get("envelope_seal")!=hashlib.sha256(canonical_json(body)).hexdigest():
-                        raise ValueError("recovered attestation envelope invalid")
-                if args.command=="decision-collect":
-                    decision_ok,decision_reasons=verify_artifact(recovered.get("decision",{}),"decision")
-                    if not decision_ok: raise ValueError("recovered decision invalid: "+"; ".join(decision_reasons))
-                    _write(args.decision_output,recovered["decision"])
-            elif args.command=="research-collect":
-                artifact=research_collect(_read(args.input),collection_providers,utc_clock)
-            elif args.command=="decision-collect":
-                decision_artifact,artifact=decision_collect(_read(args.research),_read(args.portfolio),_read(args.proposal),collection_providers,utc_clock,trusted_attestor)
-                _write(args.decision_output,decision_artifact)
-            else:
-                artifact=fill_collect(_read(args.research),_read(args.portfolio),_read(args.decision),_read(args.submission),collection_providers,utc_clock,trusted_attestor)
-            if checkpoint and not recovered.get("complete"):
-                data={"complete":True,"artifact":artifact}
-                if args.command=="decision-collect": data["decision"]=decision_artifact
-                checkpoint.write(data)
-            attestation_evidence=[]
-            if sheet_boundary is None and paper_ledger_enabled():
+        if args.command in {"portfolio-collect","research-collect","decision-collect","fill-collect"}:
+            if utc_clock is None: utc_clock=lambda: datetime.now(timezone.utc)
+            if sheet_boundary is None:
                 from .sheets import production_sheet_boundary_factory
                 sheet_boundary=production_sheet_boundary_factory()
-            if sheet_boundary is not None:
-                # The boundary itself requires the independent ledger sentinel.
-                if args.command=="decision-collect":
-                    decision_to_append=recovered["decision"] if recovered.get("complete") else decision_artifact
-                    attested=sheet_boundary.append_activated(decision_to_append,utc_clock())
-                    attestation_evidence.append(_attestation_json(attested))
-                attested=sheet_boundary.append_activated(artifact,utc_clock())
-                attestation_evidence.append(_attestation_json(attested))
-            if attestation_evidence:
-                if checkpoint:
-                    data={"complete":True,"artifact":artifact,"attestations":attestation_evidence}
-                    if args.command=="decision-collect": data["decision"]=decision_to_append
-                    checkpoint.write(data)
-            attestation_result={"artifact_id":artifact["artifact_id"],"attested":bool(attestation_evidence),
-                "envelopes":attestation_evidence,"classification":"PAPER ONLY","launch_eligible":False}
-            attestation_result["seal"]=hashlib.sha256(canonical_json(attestation_result)).hexdigest()
-            if args.attestation_output: _write(args.attestation_output,attestation_result)
-            if args.command=="decision-collect": _write(args.submission_output,artifact)
+            if trusted_attestor is None:
+                from .sheets import production_trusted_attestor_factory
+                trusted_attestor=production_trusted_attestor_factory()
+            from .attestation import load_attested_artifact, verify_attested_artifact
+            from .workflow import AtomicCheckpoint, decision_collect, fill_collect, portfolio_collect, research_collect
+            if args.command!='portfolio-collect' and collection_providers is None:
+                from .providers import production_provider_factory
+                collection_providers=production_provider_factory()
+            inputs=[_read(args.input)] if args.command in {'portfolio-collect','research-collect'} else ([ _read(args.research),_read(args.portfolio),_read(args.proposal)] if args.command=='decision-collect' else [_read(args.research),_read(args.portfolio),_read(args.decision),_read(args.submission)])
+            bindings={"command_kind":args.command,"canonical_input_hash":hashlib.sha256(canonical_json(inputs)).hexdigest(),"parent_artifact_ids":[x.get('local_artifact_id') for x in inputs if isinstance(x,dict) and x.get('local_artifact_id')],"mandate_version":DEFAULT_MANDATE.version,"provider_policy_version":"read-only-v1"}
+            checkpoint=AtomicCheckpoint(args.checkpoint,bindings) if args.checkpoint else None
+            recovered=checkpoint.read() if checkpoint else {}
+            if recovered.get('complete'):
+                envelope=load_attested_artifact(recovered['envelope'])
+                checked=verify_attested_artifact(envelope,trusted_attestor=trusted_attestor)
+                if not checked.verified: raise ValueError('recovered attested artifact invalid')
+                if args.command=='decision-collect':
+                    decision_envelope=load_attested_artifact(recovered['decision_envelope'])
+                    if not verify_attested_artifact(decision_envelope,trusted_attestor=trusted_attestor).verified: raise ValueError('recovered decision envelope invalid')
+            elif args.command=='portfolio-collect':
+                local=portfolio_collect(inputs[0]); envelope=sheet_boundary.append_envelope(local,utc_clock(),trusted_attestor=trusted_attestor)
+            elif args.command=='research-collect':
+                local=research_collect(inputs[0],collection_providers,utc_clock); envelope=sheet_boundary.append_envelope(local,utc_clock(),trusted_attestor=trusted_attestor)
+            elif args.command=='decision-collect':
+                research_parent=load_attested_artifact(inputs[0]); local_decision,local_submission=decision_collect(inputs[0],inputs[1],inputs[2],collection_providers,utc_clock,trusted_attestor)
+                decision_envelope=sheet_boundary.append_envelope(local_decision,utc_clock(),parents=(research_parent,),trusted_attestor=trusted_attestor)
+                envelope=sheet_boundary.append_envelope(local_submission,utc_clock(),parents=(decision_envelope,),trusted_attestor=trusted_attestor)
+            else:
+                submission_parent=load_attested_artifact(inputs[3]); local=fill_collect(inputs[0],inputs[1],inputs[2],inputs[3],collection_providers,utc_clock,trusted_attestor)
+                envelope=sheet_boundary.append_envelope(local,utc_clock(),parents=(submission_parent,),trusted_attestor=trusted_attestor)
+            artifact=envelope.as_json()
+            if args.command=='decision-collect': _write(args.decision_output,decision_envelope.as_json())
+            if checkpoint and not recovered.get('complete'):
+                value={'complete':True,'envelope':artifact}
+                if args.command=='decision-collect': value['decision_envelope']=decision_envelope.as_json()
+                checkpoint.write(value)
+            if args.command=='decision-collect': _write(args.submission_output,artifact)
         elif args.command in {"preflight","workflow-preflight"}:
             configured,artifact=preflight()
             if args.command=="workflow-preflight":
@@ -238,7 +216,8 @@ def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary
                     persisted_state_unchanged=persisted_before==persisted_after)
     except (KeyError,TypeError,ValueError,ArithmeticError,RuntimeError,ExternalServiceError) as error:
         artifact=_quarantine(args.command,[redact(str(error)) or error.__class__.__name__])
-    artifact.update({"classification":"PAPER ONLY","order_policy":"NO LIVE ORDER"})
+    if "envelope_id" not in artifact:
+        artifact.update({"classification":"PAPER ONLY","order_policy":"NO LIVE ORDER"})
     output=getattr(args,"output",None)
     if output: _write(output,artifact)
     elif args.command in {"decision-run","decision-collect"} and artifact.get("quarantined"):
@@ -247,7 +226,8 @@ def main(argv=None, *, collection_providers=None, utc_clock=None, sheet_boundary
         _write(args.decision_output,artifact); _write(args.submission_output,artifact)
     print(f"PAPER ONLY | NO LIVE ORDER | {args.command} | configured={configured if args.command in {'preflight','workflow-preflight'} else 'n/a'} | actionable={artifact.get('actionable', False)} | reasons={len(artifact.get('reasons',[]))}")
     if args.command in {"preflight","workflow-preflight"}: return 0 if configured and not artifact.get("quarantined") else 2
-    return 1 if args.command in {"research-run","research-collect","decision-run","decision-collect","fill-run","fill-collect"} and (
-        artifact.get("quarantined") or not artifact.get("actionable",False)) else 0
+    prospective={"research-collect","portfolio-collect","decision-collect","fill-collect"}
+    return 1 if artifact.get("quarantined") or (args.command not in prospective and args.command in
+        {"research-run","decision-run","fill-run"} and not artifact.get("actionable",False)) else 0
 
 if __name__=="__main__": raise SystemExit(main())

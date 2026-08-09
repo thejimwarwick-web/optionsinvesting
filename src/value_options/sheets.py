@@ -269,6 +269,15 @@ class SheetAttestationBoundary:
         receipt, exact = self.read_back(record, location, at)
         return record, location, (receipt, exact), appended
 
+    def append_envelope(self, artifact: Mapping[str, Any], at: datetime, *, parents=(),
+                        trusted_attestor=None, environ=None):
+        """Append/read back and return the complete immutable attested artifact."""
+        from .attestation import create_attested_artifact
+        record,location,pair,_=self.append_activated(artifact,at,environ=environ)
+        receipt,exact=pair
+        return create_attested_artifact(artifact,receipt,exact,parents=parents,
+                                        trusted_attestor=trusted_attestor)
+
     def read_back(self, record: SheetRecord, location: str, at: datetime) -> tuple[AttestationReceipt, Mapping[str, Any]]:
         require_utc(at, "read_back_at")
         actual = SheetRecord.from_row(self.port.read_row(location))
